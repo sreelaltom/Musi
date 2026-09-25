@@ -13,7 +13,7 @@ def create_musi_logo(size=512):
     padding = int(24 * scale)
     corner_radius = int(100 * scale)
     
-    # Gradient background: Deep obsidian to dark royal violet
+    # Gradient background: Deep obsidian to warm charcoal
     bg = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     bg_draw = ImageDraw.Draw(bg)
     
@@ -21,26 +21,26 @@ def create_musi_logo(size=512):
     bg_draw.rounded_rectangle(
         [padding, padding, canvas_size - padding, canvas_size - padding],
         radius=corner_radius,
-        fill=(15, 16, 26, 255) # #0F101A
+        fill=(14, 11, 7, 255) # #0E0B07 - Deep warm black
     )
     
-    # Subtle inner gradient overlay
+    # Subtle inner gradient overlay - warm amber glow
     for i in range(padding, canvas_size - padding):
         t = (i - padding) / (canvas_size - 2 * padding)
-        # Gradient from #1E1238 at top to #0D0E17 at bottom
-        r = int(30 * (1 - t) + 13 * t)
-        g = int(18 * (1 - t) + 14 * t)
-        b = int(56 * (1 - t) + 23 * t)
+        # Gradient from warm amber at top to deep charcoal at bottom
+        r = int(45 * (1 - t) + 14 * t)
+        g = int(25 * (1 - t) + 11 * t)
+        b = int(10 * (1 - t) + 7 * t)
         # We can draw horizontal lines masked
     
     img.paste(bg, (0, 0), bg)
     draw = ImageDraw.Draw(img)
 
-    # Subtle outer glow border
+    # Subtle outer glow border - warm amber
     draw.rounded_rectangle(
         [padding, padding, canvas_size - padding, canvas_size - padding],
         radius=corner_radius,
-        outline=(139, 92, 246, 90), # #8B5CF6 with alpha
+        outline=(245, 158, 11, 90), # #F59E0B with alpha - Vivid amber
         width=int(6 * scale)
     )
 
@@ -58,18 +58,18 @@ def create_musi_logo(size=512):
     total_bars_width = len(bar_heights) * bar_width + (len(bar_heights) - 1) * spacing
     start_x = cx - total_bars_width // 2
 
-    # Draw glowing backdrop behind bars
+    # Draw glowing backdrop behind bars - warm amber glow
     glow = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow)
     glow_draw.ellipse(
         [cx - int(140 * scale), cy - int(120 * scale), cx + int(140 * scale), cy + int(120 * scale)],
-        fill=(124, 58, 237, 70) # violet glow
+        fill=(245, 158, 11, 70) # #F59E0B amber glow
     )
     glow = glow.filter(ImageFilter.GaussianBlur(int(35 * scale)))
     img.paste(glow, (0, 0), glow)
     draw = ImageDraw.Draw(img)
 
-    # Color palette for bars: Gradient from #7C3AED (violet) to #EC4899 (pink/rose)
+    # Color palette for bars: Gradient from #F59E0B (vivid amber) to #EA580C (burnt orange)
     for idx, h in enumerate(bar_heights):
         bx = start_x + idx * (bar_width + spacing)
         bh = int(h * scale)
@@ -77,11 +77,11 @@ def create_musi_logo(size=512):
         by2 = cy + bh // 2
         radius = bar_width // 2
         
-        # Color interpolation across bars
+        # Color interpolation across bars - amber to orange gradient
         ratio = idx / (len(bar_heights) - 1)
-        r = int(139 * (1 - ratio) + 236 * ratio)
-        g = int(92 * (1 - ratio) + 72 * ratio)
-        b = int(246 * (1 - ratio) + 153 * ratio)
+        r = int(245 * (1 - ratio) + 234 * ratio)
+        g = int(158 * (1 - ratio) + 88 * ratio)
+        b = int(11 * (1 - ratio) + 12 * ratio)
         
         draw.rounded_rectangle(
             [bx, by1, bx + bar_width, by2],
@@ -100,7 +100,7 @@ def create_musi_logo(size=512):
         alpha = 255 if i == 1 or i == 2 else 140
         draw.ellipse(
             [dx - dot_radius, dot_y - dot_radius, dx + dot_radius, dot_y + dot_radius],
-            fill=(167, 139, 250, alpha)
+            fill=(251, 191, 36, alpha) # #FBBF24 - Gold
         )
 
     # Downsample to target size with Lanczos for ultra-crisp quality
