@@ -13,6 +13,7 @@ import '../database/settings_dao.dart';
 import '../services/audio_handler.dart';
 import '../services/music_item_resolver.dart';
 import '../services/youtube_audio_service.dart';
+import '../services/youtube_music_api_service.dart';
 
 enum PlayerRepeatMode { off, all, one }
 
@@ -26,6 +27,7 @@ class PlayerService extends ChangeNotifier {
   final SettingsDao _settingsDao = SettingsDao();
   final MusicItemResolver _resolver = MusicItemResolver();
   final YouTubeAudioService _youtubeAudioService = YouTubeAudioService();
+  final YouTubeMusicApiService _ytApiService = YouTubeMusicApiService();
 
   Song? _currentSong;
   YouTubeMusicResult? _currentYouTubeVideo;
@@ -47,11 +49,19 @@ class PlayerService extends ChangeNotifier {
   // Guards against concurrent next() calls
   bool _isNavigating = false;
 
+  // Guards against duplicate auto-advance from repeated `completed` states
+  bool _isAdvancing = false;
+
+  // Pre-warm timer: resolves next track's URL while current song still plays
+  Timer? _prewarmTimer;
+  String? _prewarmingVideoId; // tracks which videoId we're pre-warming
+
   // Stream subscriptions
   StreamSubscription? _posSub;
   StreamSubscription? _bufferedSub;
   StreamSubscription? _durSub;
   StreamSubscription? _stateSub;
+  StreamSubscription? _errSub; // ExoPlayer error stream (catches 403 directly)
 
   Song? get currentSong => _currentSong;
   YouTubeMusicResult? get currentYouTubeVideo => _currentYouTubeVideo;
@@ -62,6 +72,7 @@ class PlayerService extends ChangeNotifier {
   Duration get bufferedPosition => _bufferedPosition;
   List<Song> get queue => List.unmodifiable(_queue);
   List<PlaylistItem> get mixedQueue => List.unmodifiable(_mixedQueue);
+  List<YouTubeMusicResult> get ytQueue => List.unmodifiable(_ytQueue);
   int get currentIndex => _currentIndex;
   bool get isShuffle => _isShuffle;
   PlayerRepeatMode get repeatMode => _repeatMode;
@@ -83,6 +94,8 @@ class PlayerService extends ChangeNotifier {
     _posSub = player.positionStream.listen((pos) {
       _currentPosition = pos;
       notifyListeners();
+      // Schedule next-track pre-warm when 30s remain (or immediately for short tracks)
+      _schedulePrewarm(pos);
     });
 
     _bufferedSub?.cancel();
@@ -112,31 +125,147 @@ class PlayerService extends ChangeNotifier {
 
       notifyListeners();
     });
+
+    // Listen for ExoPlayer errors (e.g. HTTP 403 on YouTube CDN URLs).
+    // When a source error fires, cycle through ALL remaining clients in one
+    // locked loop so competing error events cannot trigger a second parallel retry.
+    bool autoRetrying = false;
+    _errSub?.cancel();
+    _errSub = player.playbackEventStream.listen(
+      (_) {}, // normal events handled above
+      onError: (Object error) async {
+        if (autoRetrying) return; // Prevent concurrent auto-retry loops
+        final errStr = error.toString();
+        debugPrint('PlayerService: ExoPlayer error: $errStr');
+        // Check if this looks like a 403/source error on a YouTube track
+        final videoId = _currentYouTubeVideo?.videoId ??
+            (_currentSong != null ? YouTubeAudioService.extractVideoId(_currentSong!) : null);
+        if (videoId == null) return;
+        if (!errStr.contains('403') && !errStr.contains('Source error') && !errStr.contains('TYPE_SOURCE')) return;
+
+        autoRetrying = true;
+        try {
+          debugPrint('PlayerService: ExoPlayer 403 detected, cycling all clients for $videoId');
+          final video = _currentYouTubeVideo ??
+              YouTubeMusicResult(
+                videoId: videoId,
+                title: _currentSong?.title ?? 'YouTube Track',
+                channelTitle: _currentSong?.artist ?? '',
+                thumbnailUrl: _currentSong?.artworkUrl ?? '',
+                youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
+              );
+
+          // Try up to 6 times — covers all 5 YoutubeExplode clients + yt-dlp
+          for (int attempt = 1; attempt <= 6; attempt++) {
+            try {
+              _youtubeAudioService.invalidateCache(videoId);
+              final refreshed = await _youtubeAudioService.resolveToSong(
+                video,
+                forceRefresh: true, // advances client index each call
+              );
+              if (refreshed != null && _audioHandler != null) {
+                _currentSong = refreshed;
+                notifyListeners();
+                await _audioHandler!.player.stop();
+                await _audioHandler!.playSongItem(refreshed);
+                debugPrint('PlayerService: Auto-retry succeeded on attempt $attempt for $videoId');
+                return; // success — exit the retry loop
+              }
+            } catch (retryErr) {
+              debugPrint('PlayerService: Auto-retry attempt $attempt failed for $videoId: $retryErr');
+              if (attempt < 6) await Future.delayed(const Duration(milliseconds: 500));
+            }
+          }
+          debugPrint('PlayerService: All auto-retry attempts exhausted for $videoId');
+        } finally {
+          autoRetrying = false;
+        }
+      },
+    );
   }
 
   void _handleSongCompletion() {
-    switch (_repeatMode) {
-      case PlayerRepeatMode.one:
-        seek(Duration.zero);
-        play();
-        break;
-      case PlayerRepeatMode.all:
-        next();
-        break;
-      case PlayerRepeatMode.off:
-        // Auto-advance if there is a next track, otherwise wrap to beginning
-        final queueLen = _ytQueue.isNotEmpty
-            ? _ytQueue.length
-            : (_mixedQueue.isNotEmpty ? _mixedQueue.length : _queue.length);
-        if (queueLen > 0) {
-          // Always advance — wraps to first song at end of queue
-          next();
-        } else {
-          pause();
-          seek(Duration.zero);
+    // A `completed` state can arrive more than once (e.g. re-emitted after a
+    // source swap). Only auto-advance on the first one so the next track is
+    // not skipped over.
+    if (_isAdvancing) return;
+    _isAdvancing = true;
+
+    Future<void> run() async {
+      try {
+        switch (_repeatMode) {
+          case PlayerRepeatMode.one:
+            await seek(Duration.zero);
+            await play();
+            break;
+          case PlayerRepeatMode.all:
+            await next();
+            break;
+          case PlayerRepeatMode.off:
+            // Hand off to next(); it decides whether to advance, wrap on
+            // repeat, or stop cleanly at the end of the queue.
+            final queueLen = _ytQueue.isNotEmpty
+                ? _ytQueue.length
+                : (_mixedQueue.isNotEmpty ? _mixedQueue.length : _queue.length);
+            if (queueLen > 0) {
+              await next();
+            } else {
+              await pause();
+              await seek(Duration.zero);
+            }
+            break;
         }
-        break;
+      } catch (e) {
+        debugPrint('PlayerService: auto-advance failed: $e');
+      }
     }
+
+    run().whenComplete(() => _isAdvancing = false);
+  }
+
+  /// Schedule pre-warming the next track URL so it's cached before completion.
+  /// Called on every position update — uses a timer so we only fire once per song.
+  void _schedulePrewarm(Duration position) {
+    if (_totalDuration == Duration.zero) return;
+    if (!_isPlaying) return;
+
+    final remaining = _totalDuration - position;
+    // Trigger 30s before end (or at 50% for tracks shorter than 60s)
+    final threshold = _totalDuration.inSeconds < 60
+        ? _totalDuration * 0.5
+        : const Duration(seconds: 30);
+
+    if (remaining <= threshold) {
+      _prewarmNextTrack();
+    }
+  }
+
+  /// Pre-resolve the next track's stream URL into the cache while the current
+  /// track is still playing. This means when auto-advance fires, the URL is
+  /// already available and next() starts with no network delay — critical for
+  /// smooth background playback.
+  void _prewarmNextTrack() {
+    if (_ytQueue.isEmpty) return;
+    final nextIdx = _currentIndex + 1;
+    if (nextIdx >= _ytQueue.length) return;
+
+    final nextVideo = _ytQueue[nextIdx];
+    final nextId = nextVideo.videoId;
+
+    // Don't pre-warm the same ID twice
+    if (_prewarmingVideoId == nextId) return;
+    _prewarmingVideoId = nextId;
+
+    _prewarmTimer?.cancel();
+    _prewarmTimer = Timer(Duration.zero, () async {
+      try {
+        debugPrint('PlayerService: Pre-warming stream URL for next track: ${nextVideo.title}');
+        await _youtubeAudioService.resolveStream(nextId);
+        debugPrint('PlayerService: ✅ Pre-warm complete for $nextId');
+      } catch (e) {
+        debugPrint('PlayerService: Pre-warm failed for $nextId: $e');
+      }
+    });
   }
 
   /// Play a [Song] object (local file or remote stream).
@@ -211,32 +340,46 @@ class PlayerService extends ChangeNotifier {
         await _audioHandler!.playSongItem(song);
       }
       await _songDao.addRecentlyPlayed(song);
+      if (YouTubeAudioService.isYouTubeSong(song)) {
+        final videoId = YouTubeAudioService.extractVideoId(song);
+        if (videoId != null) {
+          _fetchAndQueueRelatedSongsForSong(videoId, song.title, song.artist);
+        }
+      }
     } catch (e, st) {
       debugPrint('PlayerService: playSongItem failed: $e\n$st');
-      // Retry with a freshly resolved stream URL for YouTube songs
+      // Retry with fresh stream URL — rotate through clients on each attempt
       final videoId = YouTubeAudioService.extractVideoId(song);
       if (videoId != null) {
-        try {
-          debugPrint('PlayerService: Retrying fresh stream for $videoId');
+        bool recovered = false;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+          try {
+            debugPrint('PlayerService: Retry $attempt/3 for $videoId');
             _youtubeAudioService.invalidateCache(videoId);
-          final freshUrl = await _youtubeAudioService.getAudioStreamUrl(
-            videoId,
-            forceRefresh: true,
-          );
-          if (freshUrl != null && freshUrl.isNotEmpty && _audioHandler != null) {
-            final refreshedSong = song.copyWith(streamUrl: freshUrl);
-            _currentSong = refreshedSong;
-            notifyListeners();
-            // Stop only the audio player (not the media session) to clear
-            // any ExoPlayer error state before retrying with fresh URL.
-            await _audioHandler!.player.stop();
-            await _audioHandler!.playSongItem(refreshedSong);
-            await _songDao.addRecentlyPlayed(refreshedSong);
-            return;
+            final resolved = await _youtubeAudioService.resolveStream(
+              videoId,
+              forceRefresh: true, // rotates to next YouTube client each call
+            );
+            if (resolved != null && resolved.url.isNotEmpty && _audioHandler != null) {
+              final refreshedSong = song.copyWith(
+                streamUrl: resolved.url,
+                headers: resolved.headers,
+              );
+              _currentSong = refreshedSong;
+              notifyListeners();
+              await _audioHandler!.player.stop();
+              await _audioHandler!.playSongItem(refreshedSong);
+              await _songDao.addRecentlyPlayed(refreshedSong);
+              recovered = true;
+              break;
+            }
+          } catch (retryError) {
+            debugPrint('PlayerService: Retry $attempt failed: $retryError');
+            if (attempt == 3) break;
+            await Future.delayed(const Duration(milliseconds: 800));
           }
-        } catch (retryError) {
-          debugPrint('PlayerService: Retry failed: $retryError');
         }
+        if (recovered) return;
       }
 
       const err =
@@ -258,20 +401,29 @@ class PlayerService extends ChangeNotifier {
     List<YouTubeMusicResult>? contextQueue,
     List<PlaylistItem>? mixedContextQueue,
     Function(String error)? onError,
+    bool stopPlayerFirst = true,
   }) async {
     _lastError = null;
 
-    // Stop any previous playback to clear decoder error state
-    try {
-      if (_audioHandler != null) {
-        await _audioHandler!.player.stop();
+    // Stop any previous playback to clear decoder error state. Skipped during
+    // queue navigation: stopping here briefly flips `playing` to false, which
+    // drops the media foreground service and can stall track advancement once
+    // the app is backgrounded.
+    if (stopPlayerFirst) {
+      try {
+        if (_audioHandler != null) {
+          await _audioHandler!.player.stop();
+        }
+      } catch (e) {
+        debugPrint('PlayerService: stop before playYouTubeAudio failed: $e');
       }
-    } catch (e) {
-      debugPrint('PlayerService: stop before playYouTubeAudio failed: $e');
     }
 
     _isBuffering = true;
     _currentYouTubeVideo = video;
+    // Reset prewarm state for the new song so its next track gets pre-warmed
+    _prewarmingVideoId = null;
+    _prewarmTimer?.cancel();
     notifyListeners();
 
     // Store YouTube context queue for next/previous navigation
@@ -334,37 +486,93 @@ class PlayerService extends ChangeNotifier {
       notifyListeners();
 
       await _songDao.addRecentlyPlayed(song);
+      _fetchAndQueueRelatedSongs(video);
     } catch (e) {
-      // Retry with a freshly resolved stream URL (handles 403 from expired CDN URLs)
+      // Retry with fresh stream URLs — rotate through YouTube clients on each attempt
       final videoId = video.videoId;
-      try {
-        debugPrint('PlayerService: Retrying fresh stream for $videoId');
-        _youtubeAudioService.invalidateCache(videoId);
-        final freshUrl = await _youtubeAudioService.getAudioStreamUrl(
-          videoId,
-          forceRefresh: true,
-        );
-        if (freshUrl != null && freshUrl.isNotEmpty && song != null && _audioHandler != null) {
-          final refreshedSong = song.copyWith(streamUrl: freshUrl);
-          _currentSong = refreshedSong;
-          notifyListeners();
-          // Stop first to clear any ExoPlayer/AAC decoder error state
-          await _audioHandler!.player.stop();
-          await _audioHandler!.playSongItem(refreshedSong);
-          _isBuffering = false;
-          notifyListeners();
-          await _songDao.addRecentlyPlayed(refreshedSong);
-          return;
+      bool recovered = false;
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        try {
+          debugPrint('PlayerService: YouTube retry $attempt/3 for $videoId');
+          _youtubeAudioService.invalidateCache(videoId);
+          final refreshedSong = await _youtubeAudioService.resolveToSong(
+            video,
+            forceRefresh: true, // advances to next YouTube client & gets fresh headers
+          );
+          if (refreshedSong != null && _audioHandler != null) {
+            _currentSong = refreshedSong;
+            notifyListeners();
+            await _audioHandler!.player.stop();
+            await _audioHandler!.playSongItem(refreshedSong);
+            _isBuffering = false;
+            notifyListeners();
+            await _songDao.addRecentlyPlayed(refreshedSong);
+            recovered = true;
+            break;
+          }
+        } catch (retryError) {
+          debugPrint('PlayerService: YouTube retry $attempt failed: $retryError');
+          if (attempt < 3) await Future.delayed(const Duration(milliseconds: 800));
         }
-      } catch (retryError) {
-        debugPrint('PlayerService: Retry failed: $retryError');
       }
+      if (recovered) return;
 
       _isBuffering = false;
-      final msg = 'Failed to play YouTube track: $e';
+      final msg = 'Failed to play YouTube track after 3 retries. Try again.';
       _lastError = msg;
       onError?.call(msg);
       notifyListeners();
+    }
+  }
+
+  /// Automatically fetch related tracks and append them to the queue for continuous play
+  Future<void> _fetchAndQueueRelatedSongs(YouTubeMusicResult video) async {
+    await _fetchAndQueueRelatedSongsForSong(video.videoId, video.title, video.channelTitle);
+  }
+
+  /// Fetch related songs by videoId, title, and artist, and add to the queue
+  Future<void> _fetchAndQueueRelatedSongsForSong(
+    String videoId,
+    String title,
+    String artist,
+  ) async {
+    // Only fetch if queue has fewer than 5 upcoming songs to avoid excessive queuing
+    final remainingInQueue = _ytQueue.isNotEmpty
+        ? (_ytQueue.length - (_currentIndex + 1))
+        : (_mixedQueue.length - (_currentIndex + 1));
+    if (remainingInQueue > 4) return;
+
+    try {
+      debugPrint('PlayerService: Autoplaying related songs for "$title" by "$artist"...');
+      final related = await _ytApiService.getRelatedTracks(
+        videoId: videoId,
+        title: title,
+        artist: artist,
+        limit: 10,
+      );
+      if (related.isNotEmpty) {
+        final existingIds = _ytQueue.map((v) => v.videoId).toSet();
+        existingIds.add(videoId);
+        final newTracks = related.where((v) => !existingIds.contains(v.videoId)).toList();
+        if (newTracks.isNotEmpty) {
+          _ytQueue.addAll(newTracks);
+          for (final track in newTracks) {
+            _mixedQueue.add(
+              PlaylistItem.fromYouTube(
+                playlistId: '',
+                video: track,
+                position: _mixedQueue.length,
+              ),
+            );
+          }
+          notifyListeners();
+          debugPrint(
+            'PlayerService: Added ${newTracks.length} related songs to Up Next queue (total ${_ytQueue.length})',
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('PlayerService: Fetch related songs failed: $e');
     }
   }
 
@@ -443,7 +651,20 @@ class PlayerService extends ChangeNotifier {
           } else if (_currentIndex + 1 < _ytQueue.length) {
             nextIndex = _currentIndex + 1;
           } else {
-            if (_repeatMode == PlayerRepeatMode.all) {
+            // End of YouTube queue reached: fetch related songs so music keeps playing automatically
+            final lastVideo = _ytQueue.last;
+            final related = await _ytApiService.getRelatedTracks(
+              videoId: lastVideo.videoId,
+              title: lastVideo.title,
+              artist: lastVideo.channelTitle,
+              limit: 5,
+            );
+            final existingIds = _ytQueue.map((v) => v.videoId).toSet();
+            final newTracks = related.where((v) => !existingIds.contains(v.videoId)).toList();
+            if (newTracks.isNotEmpty) {
+              _ytQueue.addAll(newTracks);
+              nextIndex = _currentIndex + 1;
+            } else if (_repeatMode == PlayerRepeatMode.all) {
               nextIndex = 0;
             } else {
               _isBuffering = false;
@@ -454,11 +675,10 @@ class PlayerService extends ChangeNotifier {
           }
           _currentIndex = nextIndex;
 
-          // Stop any error state from the previous player
-          if (_audioHandler != null) {
-            await _audioHandler!.player.stop();
-          }
-          await playYouTubeAudio(_ytQueue[_currentIndex]);
+          await playYouTubeAudio(
+            _ytQueue[_currentIndex],
+            stopPlayerFirst: false,
+          );
           // If playback failed, continue to the next track (loop continues)
           if (_lastError != null) {
             debugPrint(
@@ -549,10 +769,10 @@ class PlayerService extends ChangeNotifier {
         }
         _currentIndex = prevIndex;
 
-        if (_audioHandler != null) {
-          await _audioHandler!.player.stop();
-        }
-        await playYouTubeAudio(_ytQueue[_currentIndex]);
+        await playYouTubeAudio(
+          _ytQueue[_currentIndex],
+          stopPlayerFirst: false,
+        );
         return;
       }
 

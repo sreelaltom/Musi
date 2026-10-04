@@ -7,7 +7,7 @@ class Playlist {
   final List<Song> songs;
   final String? coverUrl;
   // Total item count including YouTube videos (songs.length alone misses them)
-  final int? _itemCount;
+  final int? itemCount;
 
   const Playlist({
     required this.id,
@@ -15,11 +15,11 @@ class Playlist {
     required this.createdAt,
     this.songs = const [],
     this.coverUrl,
-    int? itemCount,
-  }) : _itemCount = itemCount;
+    this.itemCount,
+  });
 
   /// Total items in playlist: songs + YouTube videos.
-  int get songCount => _itemCount ?? songs.length;
+  int get songCount => itemCount ?? songs.length;
 
   int get totalDurationSeconds =>
       songs.fold(0, (sum, song) => sum + song.duration);
@@ -43,7 +43,7 @@ class Playlist {
       createdAt: createdAt ?? this.createdAt,
       songs: songs ?? this.songs,
       coverUrl: coverUrl ?? this.coverUrl,
-      itemCount: itemCount ?? _itemCount,
+      itemCount: itemCount ?? this.itemCount,
     );
   }
 

@@ -19,6 +19,7 @@ class Song {
   final LicenseInfo? license;
   final bool canStream;
   final bool canDownload;
+  final Map<String, String>? headers;
 
   const Song({
     required this.id,
@@ -37,6 +38,7 @@ class Song {
     this.license,
     this.canStream = true,
     this.canDownload = false,
+    this.headers,
   });
 
   bool get hasLocalFile => localPath != null && localPath!.isNotEmpty;
@@ -70,6 +72,7 @@ class Song {
     LicenseInfo? license,
     bool? canStream,
     bool? canDownload,
+    Map<String, String>? headers,
   }) {
     return Song(
       id: id ?? this.id,
@@ -88,6 +91,7 @@ class Song {
       license: license ?? this.license,
       canStream: canStream ?? this.canStream,
       canDownload: canDownload ?? this.canDownload,
+      headers: headers ?? this.headers,
     );
   }
 

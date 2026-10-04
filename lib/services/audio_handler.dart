@@ -10,7 +10,7 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   /// YouTube CDN User-Agent that matches the androidSdkless client tokens.
   /// Must be set so YouTube CDN does not block the stream request.
   static const String youtubeUserAgent =
-      'com.google.android.youtube/21.36.40 (Linux; U; Android 11) gzip';
+      'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip';
 
   // YouTube CDN User-Agent set directly on ExoPlayer via AudioPlayer.userAgent.
   // useProxyForRequestHeaders is set to false because the local proxy mechanism
@@ -37,6 +37,12 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
     // 1. Configure audio session for music playback and ducking
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.music());
+
+    // NOTE: Do NOT call session.setActive(true) here. just_audio activates the
+    // session itself inside play(), and reverts `playing` to false when that
+    // activation returns false. Claiming focus eagerly at startup (with nothing
+    // playing) makes the later activation fail, so a loaded track never
+    // advances past 0:00.
 
     // Pause when headphones are unplugged
     session.becomingNoisyEventStream.listen((_) {
@@ -106,24 +112,15 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
       final isYouTube =
           song.id.startsWith('yt_') || song.providerId == 'youtube';
 
-      // For YouTube: set User-Agent and YouTube-specific headers via
-      // AudioSource.uri headers. With useProxyForRequestHeaders: false,
-      // these headers are passed directly to ExoPlayer's DefaultHttpDataSource
-      // via buildDataSourceFactory (not through the proxy).
-      // just_audio's Android buildDataSourceFactory extracts 'User-Agent' from
-      // the headers map and sets it on DefaultHttpDataSource.Factory.
-      // X-YouTube-Client-Name/X-YouTube-Client-Id help YouTube CDN identify
-      // the request as coming from a legitimate android client.
-      // Origin/Referer help with anti-bot protection.
-      final headers = isYouTube
-          ? const {
-              'User-Agent': youtubeUserAgent,
-              'Origin': 'https://www.youtube.com',
-              'Referer': 'https://www.youtube.com/',
-              'X-YouTube-Client-Name': '3',
-              'X-YouTube-Client-Id': 'c401c970a5780ad0',
-            }
-            : null;
+      // Use song-specific headers if provided (e.g. matching the extractor client),
+      // otherwise fall back to matching YouTube User-Agent.
+      // Do NOT send browser CORS headers (Origin/Referer) to googlevideo.com CDN.
+      final headers = song.headers ??
+          (isYouTube
+              ? const {
+                  'User-Agent': youtubeUserAgent,
+                }
+              : null);
 
       await _player.setAudioSource(
         AudioSource.uri(
@@ -139,6 +136,8 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   }
 
   @override
+  // just_audio activates the audio session internally on play(); activating it
+  // here as well makes the internal activation fail and reverts to paused.
   Future<void> play() => _player.play();
 
   @override

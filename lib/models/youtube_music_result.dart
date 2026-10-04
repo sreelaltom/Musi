@@ -23,11 +23,12 @@ class YouTubeMusicResult {
     this.publishedAt,
     required this.youtubeUrl,
     this.sourceType = MusicSourceType.youtube,
+    this.streamUrl,
     this.durationSeconds,
-  }) : streamUrl = null;
+  });
 
   bool get isYouTube => sourceType == MusicSourceType.youtube;
-  bool get hasStreamUrl => false;
+  bool get hasStreamUrl => streamUrl != null && streamUrl!.isNotEmpty;
 
   String? get durationFormatted {
     final seconds = durationSeconds;
@@ -169,6 +170,32 @@ class YouTubeMusicResult {
 
   @override
   int get hashCode => videoId.hashCode;
+
+  YouTubeMusicResult copyWith({
+    String? videoId,
+    String? title,
+    String? channelTitle,
+    String? thumbnailUrl,
+    String? description,
+    DateTime? publishedAt,
+    String? youtubeUrl,
+    MusicSourceType? sourceType,
+    String? streamUrl,
+    int? durationSeconds,
+  }) {
+    return YouTubeMusicResult(
+      videoId: videoId ?? this.videoId,
+      title: title ?? this.title,
+      channelTitle: channelTitle ?? this.channelTitle,
+      thumbnailUrl: thumbnailUrl ?? this.thumbnailUrl,
+      description: description ?? this.description,
+      publishedAt: publishedAt ?? this.publishedAt,
+      youtubeUrl: youtubeUrl ?? this.youtubeUrl,
+      sourceType: sourceType ?? this.sourceType,
+      streamUrl: streamUrl ?? this.streamUrl,
+      durationSeconds: durationSeconds ?? this.durationSeconds,
+    );
+  }
 
   @override
   String toString() =>

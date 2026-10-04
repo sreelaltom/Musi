@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt_exp;
 import 'package:yt_flutter_musicapi/yt_flutter_musicapi.dart';
+import 'package:yt_flutter_musicapi/yt_flutter_musicapi_platform_interface.dart';
 
 import '../models/youtube_music_result.dart';
 
@@ -53,7 +54,12 @@ class YouTubeMusicApiService {
     String query, {
     int limit = 25,
     CancelableToken? cancelable,
+    bool includeAudioUrl = false,
   }) async {
+    if (_api == null || !_isInitialized) {
+      await initialize();
+    }
+
     if (_api == null || !_isInitialized) {
       debugPrint('YouTubeMusicApiService: not initialized');
       return [];
@@ -67,7 +73,7 @@ class YouTubeMusicApiService {
       final response = await _api!.searchMusic(
         query: query,
         limit: limit,
-        includeAudioUrl: false,
+        includeAudioUrl: includeAudioUrl,
         includeAlbumArt: true,
       );
 
@@ -92,7 +98,7 @@ class YouTubeMusicApiService {
         final durationStr = item.duration;
         final thumbnail = item.albumArt;
 
-         if (videoId.isEmpty || title == 'Unknown') continue;
+        if (videoId.isEmpty || title == 'Unknown') continue;
 
         // Parse duration (format: "MM:SS" or "HH:MM:SS")
         final durationSeconds = _parseDuration(durationStr);
@@ -105,6 +111,7 @@ class YouTubeMusicApiService {
             channelTitle: artist,
             thumbnailUrl: thumbnail ?? '',
             youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
+            streamUrl: item.audioUrl,
             durationSeconds: durationSeconds,
           ),
         );
@@ -118,12 +125,20 @@ class YouTubeMusicApiService {
   }
 
   /// Fetch 10 trending/popular music tracks from YouTube for the Homepage.
-  /// Dual strategy: tries yt_flutter_musicapi first, falls back to YoutubeExplode pure Dart.
+  /// Dual strategy: tries yt_flutter_musicapi (yt-dlp) first, falls back to YoutubeExplode pure Dart.
   Future<List<YouTubeMusicResult>> getTrendingHits({int limit = 10}) async {
+    if (_api == null || !_isInitialized) {
+      await initialize();
+    }
+
     // 1. Try Python bridge if initialized
     if (_api != null && _isInitialized) {
       try {
-        final results = await searchTracks('Trending Hits', limit: limit);
+        final results = await searchTracks(
+          'Trending Hits',
+          limit: limit,
+          includeAudioUrl: false,
+        );
         if (results.isNotEmpty) {
           return results.take(limit).toList();
         }
@@ -168,21 +183,50 @@ class YouTubeMusicApiService {
     }
   }
 
-  /// Get stream URL for a YouTube Music video
+  /// Get stream URL for a YouTube Music video via yt-dlp fast audio endpoint
   Future<String?> getStreamUrl(String videoId) async {
+    final result = await getStreamWithHeaders(videoId);
+    return result?['url'] as String?;
+  }
+
+  /// Get stream URL + required HTTP headers from yt-dlp (process=True, n-parameter deciphered).
+  /// Returns a map with 'url' (String) and 'headers' (`Map<String,String>`), or null on failure.
+  Future<Map<String, dynamic>?> getStreamWithHeaders(String videoId) async {
+    if (_api == null || !_isInitialized) {
+      await initialize();
+    }
     if (_api == null || !_isInitialized) return null;
 
     try {
-      final response = await _api!.getAudioUrlFast(videoId: videoId);
-      if (response.success && response.data != null) {
-        return response.data;
+      // getAudioUrlFast now returns the raw MethodChannel map which includes 'audioUrl' and 'headers'
+      final raw = await YtFlutterMusicapiPlatform.instance.getAudioUrlFast(videoId: videoId);
+      final responseMap = Map<String, dynamic>.from(raw);
+
+      final audioUrl = responseMap['audioUrl']?.toString() ?? '';
+      if (audioUrl.isEmpty) {
+        debugPrint('YouTubeMusicApiService: getStreamWithHeaders got empty URL');
+        return null;
       }
+
+      // Extract headers map (may be null or empty for legacy responses)
+      Map<String, String> headers = {};
+      final rawHeaders = responseMap['headers'];
+      if (rawHeaders is Map) {
+        headers = rawHeaders.map((k, v) => MapEntry(k.toString(), v.toString()));
+      }
+
+      // Ensure User-Agent is always set for CDN acceptance
+      if (!headers.containsKey('User-Agent')) {
+        headers['User-Agent'] =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+      }
+
       debugPrint(
-        'YouTubeMusicApiService: getStreamUrl failed: ${response.error}',
+        'YouTubeMusicApiService: getStreamWithHeaders ✅ url=${audioUrl.substring(0, audioUrl.length.clamp(0, 60))}... headers=${headers.keys.toList()}',
       );
-      return null;
+      return {'url': audioUrl, 'headers': headers};
     } catch (e) {
-      debugPrint('YouTubeMusicApiService: getStreamUrl failed: $e');
+      debugPrint('YouTubeMusicApiService: getStreamWithHeaders failed: $e');
       return null;
     }
   }
@@ -265,5 +309,96 @@ class YouTubeMusicApiService {
       }
     }
     return null;
+  }
+
+  /// Get related tracks for autoplay / queue continuation
+  Future<List<YouTubeMusicResult>> getRelatedTracks({
+    required String videoId,
+    required String title,
+    String? artist,
+    int limit = 10,
+  }) async {
+    if (_api == null || !_isInitialized) {
+      await initialize();
+    }
+
+    // 1. Try Python yt_flutter_musicapi getRelatedSongs
+    if (_api != null && _isInitialized) {
+      try {
+        final response = await _api!.getRelatedSongs(
+          songName: title,
+          artistName: artist ?? '',
+          limit: limit,
+          includeAudioUrl: false,
+          includeAlbumArt: true,
+        );
+        if (response.success && response.data != null && response.data!.isNotEmpty) {
+          final results = <YouTubeMusicResult>[];
+          for (final item in response.data!) {
+            if (item.videoId.isEmpty || item.videoId == videoId || item.title == 'Unknown') continue;
+            results.add(
+              YouTubeMusicResult(
+                videoId: item.videoId,
+                title: item.title,
+                channelTitle: item.artists,
+                thumbnailUrl: item.albumArt ?? '',
+                youtubeUrl: 'https://www.youtube.com/watch?v=${item.videoId}',
+                streamUrl: item.audioUrl,
+                durationSeconds: _parseDuration(item.duration) ?? 200,
+              ),
+            );
+          }
+          if (results.isNotEmpty) {
+            debugPrint(
+              'YouTubeMusicApiService: found ${results.length} related songs via yt_flutter_musicapi',
+            );
+            return results;
+          }
+        }
+      } catch (e) {
+        debugPrint('YouTubeMusicApiService: getRelatedSongs error: $e');
+      }
+    }
+
+    // 2. Pure-Dart YoutubeExplode fallback
+    yt_exp.YoutubeExplode? yt;
+    try {
+      yt = yt_exp.YoutubeExplode();
+      final video = await yt.videos.get(yt_exp.VideoId(videoId));
+      final related = await yt.videos.getRelatedVideos(video);
+      if (related != null && related.isNotEmpty) {
+        final results = <YouTubeMusicResult>[];
+        for (final v in related) {
+          if (v.id.value == videoId) continue;
+          final secs = v.duration?.inSeconds ?? 0;
+          results.add(
+            YouTubeMusicResult(
+              videoId: v.id.value,
+              title: v.title,
+              channelTitle: v.author,
+              thumbnailUrl: v.thumbnails.mediumResUrl,
+              youtubeUrl: 'https://www.youtube.com/watch?v=${v.id.value}',
+              durationSeconds: secs > 0 ? secs : 200,
+            ),
+          );
+          if (results.length == limit) break;
+        }
+        if (results.isNotEmpty) return results;
+      }
+    } catch (e) {
+      debugPrint('YouTubeMusicApiService: YoutubeExplode getRelatedVideos fallback: $e');
+    } finally {
+      yt?.close();
+    }
+
+    // 3. Fallback: Search tracks based on artist or title
+    try {
+      final query = (artist != null && artist.isNotEmpty && artist != 'Unknown Channel')
+          ? '$artist songs'
+          : '$title similar music';
+      return await searchTracks(query, limit: limit, includeAudioUrl: false);
+    } catch (_) {
+      return [];
+    }
   }
 }
