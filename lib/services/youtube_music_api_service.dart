@@ -183,6 +183,144 @@ class YouTubeMusicApiService {
     }
   }
 
+  /// Upload titles containing these terms are not the release itself (lyric
+  /// videos, covers, reactions), so they are not useful for a "new releases"
+  /// list even when they match the query.
+  static final RegExp _releaseNoise = RegExp(
+    r'(lyric|cover|reaction|interview|mashup|sped\s*up|nightcore|karaoke|'
+    r'instrumental|tutorial|full\s+album|ringtone|alarm|remix)',
+    caseSensitive: false,
+  );
+
+  /// Titles matching these look like an actual single release, so they are
+  /// preferred over other clean uploads. Deliberately does not include
+  /// "lyric": [_releaseNoise] already discards those.
+  static final RegExp _releaseHint = RegExp(
+    r'(official|music\s*video|\bmv\b|audio|visualizer)',
+    caseSensitive: false,
+  );
+
+  /// Non-alphanumerics used to build a de-duplication key for song titles.
+  static final RegExp _titleNoise = RegExp(r'[^\w\s]');
+
+  /// Fetch the newest music releases for the Homepage "Latest" section.
+  ///
+  /// Unlike [getTrendingHits] this sorts by upload date rather than relevance,
+  /// so the section tracks what is being released right now instead of being a
+  /// fixed list of songs. The Python bridge cannot sort by date, so the
+  /// pure-Dart date-sorted search is the primary path and the bridge is only a
+  /// fallback.
+  Future<List<YouTubeMusicResult>> getNewReleases({int limit = 5}) async {
+    // Fetch more candidates than needed so that filtering out lyric videos,
+    // covers and other non-releases still leaves enough genuine new songs.
+    const candidates = 30;
+
+    // 1. Date-sorted search. This is what keeps the section dynamic.
+    for (final query in const ['official audio', 'new song release']) {
+      final results = await _searchByUploadDate(query, limit: candidates);
+      final picked = _pickNewReleases(results, limit);
+      if (picked.isNotEmpty) return picked;
+    }
+
+    // 2. Fallback: bridge relevance search. Not date-sorted, but still a live
+    // query rather than a hardcoded list.
+    if (_api == null || !_isInitialized) {
+      await initialize();
+    }
+    if (_api == null || !_isInitialized) return [];
+
+    try {
+      final results = await searchTracks(
+        'new releases',
+        limit: candidates,
+        includeAudioUrl: false,
+      );
+      return _pickNewReleases(results, limit);
+    } catch (e) {
+      debugPrint(
+        'YouTubeMusicApiService: getNewReleases bridge search failed: $e',
+      );
+      return [];
+    }
+  }
+
+  /// Run a pure-Dart YouTube search sorted by upload date, newest first.
+  Future<List<YouTubeMusicResult>> _searchByUploadDate(
+    String query, {
+    int limit = 30,
+  }) async {
+    yt_exp.YoutubeExplode? yt;
+    try {
+      yt = yt_exp.YoutubeExplode();
+      final search = await yt.search
+          .search(
+            query,
+            filter: yt_exp.SortFilters.uploadDate,
+            // Same bound as the sibling YoutubeExplode calls here. Without it a
+            // stalled request would leave _loadNewReleases awaiting forever, so the
+            // Latest skeleton and the pull-to-refresh spinner never clear.
+          )
+          .timeout(const Duration(seconds: 12));
+      final tracks = <YouTubeMusicResult>[];
+      for (final v in search) {
+        final secs = v.duration?.inSeconds ?? 0;
+        // Individual songs only: skip shorts, long mixes and livestreams.
+        if (secs < 90 || secs > 480) continue;
+        tracks.add(
+          YouTubeMusicResult(
+            videoId: v.id.value,
+            title: v.title,
+            channelTitle: v.author,
+            thumbnailUrl: v.thumbnails.mediumResUrl,
+            youtubeUrl: 'https://www.youtube.com/watch?v=${v.id.value}',
+            durationSeconds: secs,
+          ),
+        );
+        if (tracks.length >= limit) break;
+      }
+      return tracks;
+    } catch (e) {
+      debugPrint(
+        'YouTubeMusicApiService: date-sorted search "$query" failed: $e',
+      );
+      return [];
+    } finally {
+      yt?.close();
+    }
+  }
+
+  /// Keep the newest uploads that look like actual releases, de-duplicated by
+  /// song title. Titles that look like a release come first; if that runs short,
+  /// other clean uploads fill the remaining slots.
+  List<YouTubeMusicResult> _pickNewReleases(
+    List<YouTubeMusicResult> results,
+    int limit,
+  ) {
+    final preferred = <YouTubeMusicResult>[];
+    final fallback = <YouTubeMusicResult>[];
+    final seenTitles = <String>{};
+
+    for (final video in results) {
+      if (preferred.length >= limit) break;
+      if (_releaseNoise.hasMatch(video.title)) continue;
+
+      final key = video.title
+          .toLowerCase()
+          .replaceAll(_titleNoise, '')
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      if (key.isEmpty || !seenTitles.add(key)) continue;
+
+      if (_releaseHint.hasMatch(video.title)) {
+        preferred.add(video);
+      } else if (fallback.length < limit) {
+        fallback.add(video);
+      }
+    }
+
+    return [...preferred, ...fallback].take(limit).toList();
+  }
+
   /// Get stream URL for a YouTube Music video via yt-dlp fast audio endpoint
   Future<String?> getStreamUrl(String videoId) async {
     final result = await getStreamWithHeaders(videoId);
@@ -199,12 +337,16 @@ class YouTubeMusicApiService {
 
     try {
       // getAudioUrlFast now returns the raw MethodChannel map which includes 'audioUrl' and 'headers'
-      final raw = await YtFlutterMusicapiPlatform.instance.getAudioUrlFast(videoId: videoId);
+      final raw = await YtFlutterMusicapiPlatform.instance.getAudioUrlFast(
+        videoId: videoId,
+      );
       final responseMap = Map<String, dynamic>.from(raw);
 
       final audioUrl = responseMap['audioUrl']?.toString() ?? '';
       if (audioUrl.isEmpty) {
-        debugPrint('YouTubeMusicApiService: getStreamWithHeaders got empty URL');
+        debugPrint(
+          'YouTubeMusicApiService: getStreamWithHeaders got empty URL',
+        );
         return null;
       }
 
@@ -212,13 +354,14 @@ class YouTubeMusicApiService {
       Map<String, String> headers = {};
       final rawHeaders = responseMap['headers'];
       if (rawHeaders is Map) {
-        headers = rawHeaders.map((k, v) => MapEntry(k.toString(), v.toString()));
+        headers = rawHeaders.map(
+          (k, v) => MapEntry(k.toString(), v.toString()),
+        );
       }
 
       // Ensure User-Agent is always set for CDN acceptance
       if (!headers.containsKey('User-Agent')) {
-        headers['User-Agent'] =
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
       }
 
       debugPrint(
@@ -325,17 +468,27 @@ class YouTubeMusicApiService {
     // 1. Try Python yt_flutter_musicapi getRelatedSongs
     if (_api != null && _isInitialized) {
       try {
-        final response = await _api!.getRelatedSongs(
-          songName: title,
-          artistName: artist ?? '',
-          limit: limit,
-          includeAudioUrl: false,
-          includeAlbumArt: true,
-        );
-        if (response.success && response.data != null && response.data!.isNotEmpty) {
+        final response = await _api!
+            .getRelatedSongs(
+              songName: title,
+              artistName: artist ?? '',
+              limit: limit,
+              includeAudioUrl: false,
+              includeAlbumArt: true,
+            )
+            // Bounded: the Chaquopy bridge can stall while the app is
+            // backgrounded, which would otherwise stall the whole lookup.
+            .timeout(const Duration(seconds: 12));
+        if (response.success &&
+            response.data != null &&
+            response.data!.isNotEmpty) {
           final results = <YouTubeMusicResult>[];
           for (final item in response.data!) {
-            if (item.videoId.isEmpty || item.videoId == videoId || item.title == 'Unknown') continue;
+            if (item.videoId.isEmpty ||
+                item.videoId == videoId ||
+                item.title == 'Unknown') {
+              continue;
+            }
             results.add(
               YouTubeMusicResult(
                 videoId: item.videoId,
@@ -360,17 +513,59 @@ class YouTubeMusicApiService {
       }
     }
 
-    // 2. Pure-Dart YoutubeExplode fallback
+    // 2 & 3. Pure-Dart YoutubeExplode fallbacks — no Python bridge involved, so
+    // these still work when the app is backgrounded and the bridge is stalling.
     yt_exp.YoutubeExplode? yt;
     try {
       yt = yt_exp.YoutubeExplode();
-      final video = await yt.videos.get(yt_exp.VideoId(videoId));
-      final related = await yt.videos.getRelatedVideos(video);
-      if (related != null && related.isNotEmpty) {
+      try {
+        final video = await yt.videos
+            .get(yt_exp.VideoId(videoId))
+            .timeout(const Duration(seconds: 12));
+        final related = await yt.videos
+            .getRelatedVideos(video)
+            .timeout(const Duration(seconds: 12));
+        if (related != null && related.isNotEmpty) {
+          final results = <YouTubeMusicResult>[];
+          for (final v in related) {
+            if (v.id.value == videoId) continue;
+            final secs = v.duration?.inSeconds ?? 0;
+            results.add(
+              YouTubeMusicResult(
+                videoId: v.id.value,
+                title: v.title,
+                channelTitle: v.author,
+                thumbnailUrl: v.thumbnails.mediumResUrl,
+                youtubeUrl: 'https://www.youtube.com/watch?v=${v.id.value}',
+                durationSeconds: secs > 0 ? secs : 200,
+              ),
+            );
+            if (results.length == limit) break;
+          }
+          if (results.isNotEmpty) return results;
+        }
+      } catch (e) {
+        debugPrint(
+          'YouTubeMusicApiService: YoutubeExplode getRelatedVideos fallback: $e',
+        );
+      }
+
+      // 3. Search by artist/title through YoutubeExplode. Unlike
+      // getRelatedVideos this does not need the source video's watch page, so it
+      // still works when YouTube rate-limits per-video lookups.
+      try {
+        final query =
+            (artist != null && artist.isNotEmpty && artist != 'Unknown Channel')
+            ? '$artist songs'
+            : '$title songs';
+        final found = await yt.search
+            .search(query)
+            .timeout(const Duration(seconds: 12));
         final results = <YouTubeMusicResult>[];
-        for (final v in related) {
+        for (final v in found) {
           if (v.id.value == videoId) continue;
           final secs = v.duration?.inSeconds ?? 0;
+          if (secs > 0 && secs < 45) continue;
           results.add(
             YouTubeMusicResult(
               videoId: v.id.value,
@@ -383,20 +578,32 @@ class YouTubeMusicApiService {
           );
           if (results.length == limit) break;
         }
-        if (results.isNotEmpty) return results;
+        if (results.isNotEmpty) {
+          debugPrint(
+            'YouTubeMusicApiService: found ${results.length} related songs via YoutubeExplode search',
+          );
+          return results;
+        }
+      } catch (e) {
+        debugPrint(
+          'YouTubeMusicApiService: YoutubeExplode search fallback: $e',
+        );
       }
-    } catch (e) {
-      debugPrint('YouTubeMusicApiService: YoutubeExplode getRelatedVideos fallback: $e');
     } finally {
       yt?.close();
     }
 
-    // 3. Fallback: Search tracks based on artist or title
+    // 4. Fallback: Search tracks based on artist or title
     try {
-      final query = (artist != null && artist.isNotEmpty && artist != 'Unknown Channel')
+      final query =
+          (artist != null && artist.isNotEmpty && artist != 'Unknown Channel')
           ? '$artist songs'
           : '$title similar music';
-      return await searchTracks(query, limit: limit, includeAudioUrl: false);
+      return await searchTracks(
+        query,
+        limit: limit,
+        includeAudioUrl: false,
+      ).timeout(const Duration(seconds: 15));
     } catch (_) {
       return [];
     }

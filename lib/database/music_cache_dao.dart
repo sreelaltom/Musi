@@ -61,6 +61,24 @@ class MusicCacheDao {
     return maps.map((m) => MusicCacheEntry.fromMap(m)).toList();
   }
 
+  /// Songs most recently searched *or* played, newest first.
+  ///
+  /// Orders by whichever happened more recently, so a song the user just played
+  /// rises above one that was only searched earlier. Backs the Search page's
+  /// recent list. ISO-8601 strings sort chronologically, so MAX() is safe here.
+  Future<List<MusicCacheEntry>> getRecentlySearchedOrPlayed({
+    int limit = 25,
+  }) async {
+    final db = await _db;
+    final maps = await db.rawQuery(
+      'SELECT * FROM music_cache '
+      "ORDER BY MAX(COALESCE(last_played_at, ''), COALESCE(cached_at, '')) DESC "
+      'LIMIT ?',
+      [limit],
+    );
+    return maps.map((m) => MusicCacheEntry.fromMap(m)).toList();
+  }
+
   Future<List<MusicCacheEntry>> getRecentCached({int limit = 20}) async {
     final db = await _db;
     final maps = await db.query(

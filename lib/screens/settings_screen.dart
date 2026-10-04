@@ -23,9 +23,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _audioQuality = 'High (256 kbps)';
   bool _offlineModeOnly = false;
   bool _normalizeVolume = true;
-  bool _jamendoEnabled = true;
   bool _youtubeEnabled = true;
-  bool _openLicensedEnabled = true;
   String _cacheSizeFormatted = 'Calculating...';
   String _downloadsSizeFormatted = 'Calculating...';
 
@@ -49,27 +47,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _audioQuality = quality;
         _offlineModeOnly = offline;
         _normalizeVolume = volume;
-        _jamendoEnabled = _providerManager.isProviderEnabled('jamendo');
         _youtubeEnabled = _providerManager.isProviderEnabled('youtube');
-        _openLicensedEnabled = _providerManager.isProviderEnabled('mock');
         _cacheSizeFormatted = _formatBytes(cacheBytes);
         _downloadsSizeFormatted = _formatBytes(downloadBytes);
       });
     }
   }
 
-  Future<void> _setProviderEnabled(String providerId, bool enabled) async {
-    setState(() {
-      if (providerId == 'jamendo') _jamendoEnabled = enabled;
-      if (providerId == 'youtube') _youtubeEnabled = enabled;
-      if (providerId == 'mock') _openLicensedEnabled = enabled;
-    });
+  Future<void> _setYouTubeEnabled(bool enabled) async {
+    setState(() => _youtubeEnabled = enabled);
     try {
-      if (providerId == 'youtube') {
-        await _providerManager.setYouTubeEnabled(enabled);
-      } else {
-        await _providerManager.setProviderEnabled(providerId, enabled);
-      }
+      await _providerManager.setYouTubeEnabled(enabled);
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -221,23 +209,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _buildSectionHeader('MUSIC SOURCES'),
           SwitchListTile(
             secondary: const Icon(
-              Icons.library_music_rounded,
-              color: AppTheme.textPrimary,
-            ),
-            title: const Text(
-              'Jamendo',
-              style: TextStyle(color: AppTheme.textPrimary),
-            ),
-            subtitle: const Text(
-              'Creative Commons music discovery and playback',
-              style: TextStyle(color: AppTheme.textMuted),
-            ),
-            value: _jamendoEnabled,
-            activeThumbColor: AppTheme.accent,
-            onChanged: (value) => _setProviderEnabled('jamendo', value),
-          ),
-          SwitchListTile(
-            secondary: const Icon(
               Icons.video_library_rounded,
               color: AppTheme.textPrimary,
             ),
@@ -245,30 +216,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'YouTube',
               style: TextStyle(color: AppTheme.textPrimary),
             ),
-            subtitle: Text(
-              'YouTube Music search and playback (Android-only, Python bridge)',
-              style: const TextStyle(color: AppTheme.textMuted),
+            // Describes what the source is without exposing the underlying
+            // bridge implementation details.
+            subtitle: const Text(
+              'YouTube Music search and playback',
+              style: TextStyle(color: AppTheme.textMuted),
             ),
             value: _youtubeEnabled,
             activeThumbColor: AppTheme.accent,
-            onChanged: (value) => _setProviderEnabled('youtube', value),
-          ),
-          SwitchListTile(
-            secondary: const Icon(
-              Icons.shield_moon_rounded,
-              color: AppTheme.textPrimary,
-            ),
-            title: const Text(
-              'Open Licensed Sources',
-              style: TextStyle(color: AppTheme.textPrimary),
-            ),
-            subtitle: const Text(
-              'Built-in public domain and Creative Commons catalog',
-              style: TextStyle(color: AppTheme.textMuted),
-            ),
-            value: _openLicensedEnabled,
-            activeThumbColor: AppTheme.accent,
-            onChanged: (value) => _setProviderEnabled('mock', value),
+            onChanged: _setYouTubeEnabled,
           ),
 
           const SizedBox(height: 20),

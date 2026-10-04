@@ -174,6 +174,15 @@ class LibraryService extends ChangeNotifier {
       _likedYouTubeVideoIds.remove(video.videoId);
       _likedYouTubeVideos.removeWhere((v) => v.videoId == video.videoId);
     }
+    // Mirror into _likedSongIds exactly as toggleLike does. isLiked() checks
+    // both sets for 'yt_' ids, so leaving this set stale would keep a video
+    // showing as liked after unliking it from one screen while another screen
+    // had liked it.
+    if (willLike) {
+      _likedSongIds.add('yt_${video.videoId}');
+    } else {
+      _likedSongIds.remove('yt_${video.videoId}');
+    }
     notifyListeners();
 
     if (willLike) {

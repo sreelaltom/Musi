@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
@@ -43,6 +44,23 @@ class YouTubeAudioService {
   // Track which client index to try next per videoId (rotates on 403)
   final Map<String, int> _clientIndex = {};
 
+  /// The cached stream for [videoId], or null when nothing fresh is cached.
+  ///
+  /// Reads the cache without triggering a resolve, so a caller can use a
+  /// pre-warmed URL and start playback immediately. This is what makes Next
+  /// instant: the previous song's pre-warm fills this entry while it plays.
+  ResolvedAudioStream? peekCachedStream(String videoId) {
+    if (videoId.isEmpty) return null;
+    final cached = _streamCache[videoId];
+    if (cached == null || cached.isExpired) return null;
+    debugPrint('YouTubeAudioService: Cache hit for $videoId');
+    return ResolvedAudioStream(
+      url: cached.url,
+      totalBytes: cached.totalBytes,
+      headers: cached.headers,
+    );
+  }
+
   /// Resolves a playable audio stream for [videoId].
   ///
   /// On forceRefresh: advances to the next client in the cascade so repeated
@@ -55,20 +73,15 @@ class YouTubeAudioService {
 
     // Return cached URL if still fresh (cache 10min — conservative to avoid stale)
     if (!forceRefresh) {
-      final cached = _streamCache[videoId];
-      if (cached != null && !cached.isExpired) {
-        debugPrint('YouTubeAudioService: Cache hit for $videoId');
-        return ResolvedAudioStream(
-          url: cached.url,
-          totalBytes: cached.totalBytes,
-          headers: cached.headers,
-        );
-      }
+      final cached = peekCachedStream(videoId);
+      if (cached != null) return cached;
     }
 
     // Deduplicate in-flight requests for the same videoId
     if (!forceRefresh && _inflight.containsKey(videoId)) {
-      debugPrint('YouTubeAudioService: Awaiting in-flight resolve for $videoId');
+      debugPrint(
+        'YouTubeAudioService: Awaiting in-flight resolve for $videoId',
+      );
       return _inflight[videoId];
     }
 
@@ -82,33 +95,57 @@ class YouTubeAudioService {
     }
   }
 
+  /// Hard cap on one whole resolve, across every client attempt.
+  ///
+  /// Without this the cascade could run 5 YoutubeExplode clients at 20s each
+  /// plus a 30s yt-dlp call — over two minutes for a single track. That resolve
+  /// happens inside PlayerService's navigation worker, so for that entire time
+  /// every further Next press could only log "queued (N pending)" and nothing
+  /// appeared to execute.
+  static const Duration _resolveBudget = Duration(seconds: 30);
+
+  /// Per-client manifest timeout, clamped to whatever budget is left.
+  static const Duration _clientTimeout = Duration(seconds: 20);
+
   /// All supported clients in priority order with their matching request headers.
   /// NOTE: Must be `final` not `const` — YoutubeApiClient is not a const type.
   static final _allClients = [
     (
       YoutubeApiClient.androidSdkless,
       'androidSdkless',
-      const {'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip'},
+      const {
+        'User-Agent':
+            'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+      },
     ),
     (
       YoutubeApiClient.android,
       'android',
-      const {'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip'},
+      const {
+        'User-Agent':
+            'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
+      },
     ),
     (
       YoutubeApiClient.ios,
       'ios',
-      const {'User-Agent': 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)'},
+      const {
+        'User-Agent': 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+      },
     ),
     (
       YoutubeApiClient.mweb,
       'mweb',
-      const {'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36'},
+      const {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36',
+      },
     ),
     (
       YoutubeApiClient.androidVr,
       'androidVr',
-      const {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; Quest 2) AppleWebKit/537.36 (KHTML, like Gecko) OculusBrowser/15.0.0.499887770 Safari/537.36'},
+      const {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; Quest 2) AppleWebKit/537.36 (KHTML, like Gecko) OculusBrowser/15.0.0.499887770 Safari/537.36',
+      },
     ),
   ];
 
@@ -116,7 +153,14 @@ class YouTubeAudioService {
     String videoId, {
     bool forceRefresh = false,
   }) async {
-    debugPrint('YouTubeAudioService: Resolving stream for $videoId (forceRefresh=$forceRefresh)');
+    debugPrint(
+      'YouTubeAudioService: Resolving stream for $videoId (forceRefresh=$forceRefresh)',
+    );
+
+    // Caps this whole resolve, including every fallback below. Navigation calls
+    // this while holding the queue's single worker, so an unbounded cascade left
+    // further skips stuck showing as pending with nothing executing.
+    final deadline = DateTime.now().add(_resolveBudget);
 
     if (forceRefresh) {
       // On 403 retry: race yt-dlp vs next YoutubeExplode client in parallel.
@@ -126,7 +170,9 @@ class YouTubeAudioService {
       _clientIndex[videoId] = nextIdx;
       final (nextClient, nextClientName, nextHeaders) = _allClients[nextIdx];
 
-      debugPrint('YouTubeAudioService: 403 retry — racing yt-dlp vs $nextClientName for $videoId');
+      debugPrint(
+        'YouTubeAudioService: 403 retry — racing yt-dlp vs $nextClientName for $videoId',
+      );
 
       ResolvedAudioStream? result;
       try {
@@ -140,79 +186,146 @@ class YouTubeAudioService {
             completer.complete(r);
           } else {
             pending--;
-            if (pending == 0 && !completer.isCompleted) completer.complete(null);
+            if (pending == 0 && !completer.isCompleted) {
+              completer.complete(null);
+            }
           }
         }
 
-        // yt-dlp: deciphers n-param → URL works for all Range requests
-        _apiService.getStreamWithHeaders(videoId).then((data) {
-          if (data == null || (data['url'] as String? ?? '').isEmpty) {
-            onResult(null, 'yt-dlp');
-            return;
-          }
-          final url = data['url'] as String;
-          final rawH = data['headers'];
-          Map<String, String> h = {};
-          if (rawH is Map) h = rawH.map((k, v) => MapEntry(k.toString(), v.toString()));
-          if (!h.containsKey('User-Agent')) {
-            h['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-          }
-          onResult(ResolvedAudioStream(url: url, totalBytes: 0, headers: h), 'yt-dlp');
-        }).catchError((e) {
-          debugPrint('YouTubeAudioService: yt-dlp race error: $e');
-          onResult(null, 'yt-dlp');
-        });
+        // yt-dlp: deciphers n-param → URL works for all Range requests.
+        // Must be bounded: the Chaquopy Python bridge can stall indefinitely
+        // once the app is backgrounded.
+        _apiService
+            .getStreamWithHeaders(videoId)
+            .timeout(const Duration(seconds: 30))
+            .then((data) {
+              if (data == null || (data['url'] as String? ?? '').isEmpty) {
+                onResult(null, 'yt-dlp');
+                return;
+              }
+              final url = data['url'] as String;
+              final rawH = data['headers'];
+              Map<String, String> h = {};
+              if (rawH is Map) {
+                h = rawH.map((k, v) => MapEntry(k.toString(), v.toString()));
+              }
+              if (!h.containsKey('User-Agent')) {
+                h['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+              }
+              onResult(
+                ResolvedAudioStream(url: url, totalBytes: 0, headers: h),
+                'yt-dlp',
+              );
+            })
+            .catchError((e) {
+              debugPrint('YouTubeAudioService: yt-dlp race error: $e');
+              onResult(null, 'yt-dlp');
+            });
 
         // Next YoutubeExplode client: fast < 3s
         _yt.videos.streamsClient
-            .getManifest(videoId, ytClients: [nextClient], requireWatchPage: false)
+            .getManifest(
+              videoId,
+              ytClients: [nextClient],
+              requireWatchPage: false,
+            )
             .timeout(const Duration(seconds: 20))
             .then((manifest) {
               final resolved = _bestStream(manifest, videoId);
-              if (resolved == null) { onResult(null, nextClientName); return; }
+              if (resolved == null) {
+                onResult(null, nextClientName);
+                return;
+              }
               onResult(
-                ResolvedAudioStream(url: resolved.url, totalBytes: resolved.totalBytes, headers: nextHeaders),
+                ResolvedAudioStream(
+                  url: resolved.url,
+                  totalBytes: resolved.totalBytes,
+                  headers: nextHeaders,
+                ),
                 nextClientName,
               );
-            }).catchError((e) {
+            })
+            .catchError((e) {
               debugPrint('YouTubeAudioService: $nextClientName race error: $e');
               onResult(null, nextClientName);
             });
 
-        result = await completer.future;
+        // Backstop: never await this unbounded. If the YoutubeExplode client fails
+        // while yt-dlp is still stalled, `pending` only decrements once and the
+        // completer would never complete — which left resolveStream awaiting
+        // forever and wedged PlayerService._isNavigating so that no further
+        // track could ever start (including from the notification).
+        result = await completer.future.timeout(
+          const Duration(seconds: 35),
+          onTimeout: () => null,
+        );
       } catch (e) {
         debugPrint('YouTubeAudioService: race completer error: $e');
         result = null;
       }
 
       if (result != null) {
-        _streamCache[videoId] = _CachedStream(result.url, result.totalBytes, headers: result.headers);
+        _streamCache[videoId] = _CachedStream(
+          result.url,
+          result.totalBytes,
+          headers: result.headers,
+        );
         return result;
       }
 
       // Both failed — try remaining YoutubeExplode clients sequentially
-      debugPrint('YouTubeAudioService: race failed, trying remaining clients for $videoId');
+      debugPrint(
+        'YouTubeAudioService: race failed, trying remaining clients for $videoId',
+      );
       for (int i = 0; i < _allClients.length; i++) {
+        final remainingBudget = deadline.difference(DateTime.now());
+        if (remainingBudget <= Duration.zero) {
+          debugPrint(
+            'YouTubeAudioService: resolve budget exhausted for $videoId, '
+            'stopping client fallback',
+          );
+          break;
+        }
         final idx = (nextIdx + 1 + i) % _allClients.length;
         if (idx == nextIdx) continue;
         final (client, clientName, headers) = _allClients[idx];
         try {
           final manifest = await _yt.videos.streamsClient
-              .getManifest(videoId, ytClients: [client], requireWatchPage: false)
-              .timeout(const Duration(seconds: 20));
+              .getManifest(
+                videoId,
+                ytClients: [client],
+                requireWatchPage: false,
+              )
+              .timeout(
+                remainingBudget < _clientTimeout
+                    ? remainingBudget
+                    : _clientTimeout,
+              );
           final resolved = _bestStream(manifest, videoId);
           if (resolved == null) continue;
-          debugPrint('YouTubeAudioService: ✅ $clientName resolved on fallback for $videoId');
+          debugPrint(
+            'YouTubeAudioService: ✅ $clientName resolved on fallback for $videoId',
+          );
           _clientIndex[videoId] = idx;
-          final r = ResolvedAudioStream(url: resolved.url, totalBytes: resolved.totalBytes, headers: headers);
-          _streamCache[videoId] = _CachedStream(r.url, r.totalBytes, headers: r.headers);
+          final r = ResolvedAudioStream(
+            url: resolved.url,
+            totalBytes: resolved.totalBytes,
+            headers: headers,
+          );
+          _streamCache[videoId] = _CachedStream(
+            r.url,
+            r.totalBytes,
+            headers: r.headers,
+          );
           return r;
         } catch (e) {
           debugPrint('YouTubeAudioService: $clientName failed: $e');
         }
       }
 
-      debugPrint('YouTubeAudioService: ❌ All retry strategies failed for $videoId');
+      debugPrint(
+        'YouTubeAudioService: ❌ All retry strategies failed for $videoId',
+      );
       return null;
     }
 
@@ -222,14 +335,27 @@ class YouTubeAudioService {
     final startIndex = _clientIndex[videoId] ?? 0;
 
     for (int i = 0; i < _allClients.length; i++) {
+      final remainingBudget = deadline.difference(DateTime.now());
+      if (remainingBudget <= Duration.zero) {
+        debugPrint(
+          'YouTubeAudioService: resolve budget exhausted for $videoId',
+        );
+        return null;
+      }
       final idx = (startIndex + i) % _allClients.length;
       final (client, clientName, headers) = _allClients[idx];
 
       try {
-        debugPrint('YouTubeAudioService: Trying client $clientName for $videoId');
+        debugPrint(
+          'YouTubeAudioService: Trying client $clientName for $videoId',
+        );
         final manifest = await _yt.videos.streamsClient
             .getManifest(videoId, ytClients: [client], requireWatchPage: false)
-            .timeout(const Duration(seconds: 20));
+            .timeout(
+              remainingBudget < _clientTimeout
+                  ? remainingBudget
+                  : _clientTimeout,
+            );
 
         final resolved = _bestStream(manifest, videoId);
         if (resolved == null) continue;
@@ -251,33 +377,66 @@ class YouTubeAudioService {
           headers: headers,
         );
       } catch (e) {
-        debugPrint('YouTubeAudioService: Client $clientName failed for $videoId: $e');
+        debugPrint(
+          'YouTubeAudioService: Client $clientName failed for $videoId: $e',
+        );
       }
     }
 
     // All YoutubeExplode clients failed — try yt-dlp as last resort
-    debugPrint('YouTubeAudioService: All YE clients failed, trying yt-dlp for $videoId');
+    debugPrint(
+      'YouTubeAudioService: All YE clients failed, trying yt-dlp for $videoId',
+    );
     try {
-      final streamData = await _apiService.getStreamWithHeaders(videoId);
+      final ytdlpBudget = deadline.difference(DateTime.now());
+      if (ytdlpBudget <= Duration.zero) {
+        debugPrint(
+          'YouTubeAudioService: no budget left for yt-dlp on $videoId',
+        );
+        return null;
+      }
+      final streamData = await _apiService
+          .getStreamWithHeaders(videoId)
+          // Bounded for the same reason as the race above: an unbounded
+          // Chaquopy call here would leave resolveStream awaiting forever and
+          // wedge PlayerService navigation.
+          .timeout(
+            ytdlpBudget < const Duration(seconds: 30)
+                ? ytdlpBudget
+                : const Duration(seconds: 30),
+          );
       if (streamData != null) {
         final fastUrl = streamData['url'] as String? ?? '';
         final rawHeaders = streamData['headers'];
         Map<String, String> ytdlpHeaders = {};
         if (rawHeaders is Map) {
-          ytdlpHeaders = rawHeaders.map((k, v) => MapEntry(k.toString(), v.toString()));
+          ytdlpHeaders = rawHeaders.map(
+            (k, v) => MapEntry(k.toString(), v.toString()),
+          );
         }
         if (!ytdlpHeaders.containsKey('User-Agent')) {
-          ytdlpHeaders['User-Agent'] =
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+          ytdlpHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
         }
         if (fastUrl.isNotEmpty) {
-          _streamCache[videoId] = _CachedStream(fastUrl, 0, headers: ytdlpHeaders);
-          debugPrint('YouTubeAudioService: ✅ yt-dlp last-resort resolved for $videoId');
-          return ResolvedAudioStream(url: fastUrl, totalBytes: 0, headers: ytdlpHeaders);
+          _streamCache[videoId] = _CachedStream(
+            fastUrl,
+            0,
+            headers: ytdlpHeaders,
+          );
+          debugPrint(
+            'YouTubeAudioService: ✅ yt-dlp last-resort resolved for $videoId',
+          );
+          return ResolvedAudioStream(
+            url: fastUrl,
+            totalBytes: 0,
+            headers: ytdlpHeaders,
+          );
         }
       }
     } catch (e) {
-      debugPrint('YouTubeAudioService: yt-dlp last-resort failed for $videoId: $e');
+      debugPrint(
+        'YouTubeAudioService: yt-dlp last-resort failed for $videoId: $e',
+      );
     }
 
     debugPrint('YouTubeAudioService: ❌ All strategies failed for $videoId');
@@ -285,7 +444,10 @@ class YouTubeAudioService {
   }
 
   /// Pick the best audio stream from a manifest.
-  /// Priority: MP4/AAC (ExoPlayer native) → WebM/Opus → muxed
+  ///
+  /// Priority: MP4/AAC (ExoPlayer native) → WebM/Opus. Audio-only only; a muxed
+  /// audio+video URL is never returned because ExoPlayer would decode and
+  /// discard the video track.
   ResolvedAudioStream? _bestStream(StreamManifest manifest, String videoId) {
     // 1. Prefer MP4/AAC (itag 140: 128kbps) — ExoPlayer native, most compatible
     final mp4 = manifest.audioOnly
@@ -313,18 +475,22 @@ class YouTubeAudioService {
       );
     }
 
-    // 3. Muxed stream (audio+video) as last resort
-    final muxed = manifest.muxed.toList();
-    if (muxed.isNotEmpty) {
-      final best = muxed.reduce(
-        (a, b) => a.bitrate.bitsPerSecond > b.bitrate.bitsPerSecond ? a : b,
-      );
-      return ResolvedAudioStream(
-        url: best.url.toString(),
-        totalBytes: best.size.totalBytes,
-      );
-    }
-
+    // Muxed (audio+video) streams are deliberately NOT used.
+    //
+    // This is an audio-only app, and ExoPlayer does not drop the video track
+    // from a muxed URL: it decodes every frame and throws it away. On device
+    // that showed up as `c2.mtk.avc.decoder 640x360 ... renderFps=0,
+    // discardFps=24` plus a permanently saturated `PipelineWatcher: pipelineFull`
+    // queue. Beyond wasted battery, it burns ~10x the bandwidth of an
+    // audio-only stream for data that is immediately discarded, so a burst of
+    // Next presses starved the audio pipeline and tracks appeared not to load.
+    //
+    // Returning null instead makes the client cascade move on to the next
+    // client, and the yt-dlp `bestaudio` path remains as the final backstop.
+    debugPrint(
+      'YouTubeAudioService: no audio-only stream for $videoId '
+      '(muxed skipped: ${manifest.muxed.length} available)',
+    );
     return null;
   }
 
@@ -343,6 +509,16 @@ class YouTubeAudioService {
     debugPrint('YouTubeAudioService: Cache invalidated for $videoId');
   }
 
+  /// Seed the stream cache for [videoId].
+  ///
+  /// Test seam: lets the pre-warm path be exercised without a real network
+  /// resolve, so the "pre-warmed URL wins over the related-endpoint URL"
+  /// behaviour stays covered.
+  @visibleForTesting
+  void cacheStreamForTesting(String videoId, String url) {
+    _streamCache[videoId] = _CachedStream(url, 0);
+  }
+
   /// Converts a YouTubeMusicResult into a playable Song object.
   Future<Song?> resolveToSong(
     YouTubeMusicResult video, {
@@ -351,14 +527,48 @@ class YouTubeAudioService {
     String? streamUrl;
     Map<String, String>? headers;
 
-    // Only use pre-resolved streamUrl if not forcing a fresh refresh
-    if (!forceRefresh && video.streamUrl != null && video.streamUrl!.isNotEmpty) {
-      streamUrl = video.streamUrl;
-      debugPrint('YouTubeAudioService: Using pre-resolved streamUrl for ${video.videoId}');
+    // A pre-warmed cache entry wins over everything. It is a URL this service
+    // already verified, chose as audio-only, and paired with working headers,
+    // and it was fetched in the background while the previous song played — so
+    // this is the path that makes Next instant from the app, the notification,
+    // Bluetooth, and with the screen off.
+    final prewarmed = forceRefresh ? null : peekCachedStream(video.videoId);
+    if (prewarmed != null) {
+      streamUrl = prewarmed.url;
+      headers = prewarmed.headers;
+      debugPrint(
+        'YouTubeAudioService: Using pre-warmed stream for ${video.videoId}',
+      );
     } else {
-      final resolved = await resolveStream(video.videoId, forceRefresh: forceRefresh);
-      streamUrl = resolved?.url;
-      headers = resolved?.headers;
+      // Otherwise resolve properly, and only fall back to the endpoint URL if
+      // that produced nothing.
+      //
+      // `video.streamUrl` is deliberately NOT preferred here.
+      // `searchTracks` and `getRelatedTracks` copy `audioUrl` straight off the
+      // browse/related response, and those URLs are unverified: they expire
+      // quickly and are frequently muxed audio+video. just_audio exposes no way
+      // to disable ExoPlayer's video decoder, so a single muxed URL is enough to
+      // start decoding frames the app never displays
+      // (`c2.mtk.avc.decoder ... renderFps=0, discardFps=25`) and to keep the
+      // pipeline permanently saturated, which is what stalled Next. Resolving
+      // first is the only way to guarantee an audio-only URL.
+      final resolved = await resolveStream(
+        video.videoId,
+        forceRefresh: forceRefresh,
+      );
+      if (resolved != null && resolved.url.isNotEmpty) {
+        streamUrl = resolved.url;
+        headers = resolved.headers;
+      } else if (!forceRefresh &&
+          video.streamUrl != null &&
+          video.streamUrl!.isNotEmpty) {
+        // Last resort — better than failing to play at all.
+        streamUrl = video.streamUrl;
+        debugPrint(
+          'YouTubeAudioService: no resolved stream for ${video.videoId}, '
+          'falling back to endpoint URL',
+        );
+      }
     }
 
     if (streamUrl == null || streamUrl.isEmpty) {
@@ -441,7 +651,7 @@ class _CachedStream {
   final DateTime createdAt;
 
   _CachedStream(this.url, this.totalBytes, {this.headers})
-      : createdAt = DateTime.now();
+    : createdAt = DateTime.now();
 
   // Cache for 10 minutes — short TTL to prevent stale IP-bound token 403s
   bool get isExpired =>

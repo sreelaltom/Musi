@@ -136,7 +136,9 @@ class MusicCacheEntry {
       sourceUrl: video.youtubeUrl,
       youtubeVideoId: video.videoId,
       provider: 'youtube',
-      duration: 0,
+      // Persist the duration so results seeded from the cache show the same
+      // track length as a live search instead of a blank/0:00.
+      duration: video.durationSeconds ?? 0,
       cachedAt: DateTime.now(),
     );
   }

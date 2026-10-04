@@ -19,11 +19,11 @@ class HomeScreen extends StatefulWidget {
   final VoidCallback onSearchTap;
   final void Function(int tabIndex) onNavigateToLibrary;
 
-   const HomeScreen({
-     super.key,
-     required this.onSearchTap,
-     required this.onNavigateToLibrary,
-   });
+  const HomeScreen({
+    super.key,
+    required this.onSearchTap,
+    required this.onNavigateToLibrary,
+  });
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -39,10 +39,21 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _trendingError;
   String? _loadingVideoId;
 
+  /// Newest releases, sourced from a date-sorted query rather than a fixed list.
+  List<YouTubeMusicResult> _newReleases = [];
+  bool _isLoadingNewReleases = true;
+  String? _newReleasesError;
+  String? _loadingReleaseId;
+
   @override
   void initState() {
     super.initState();
-    _loadTrendingTracks();
+    _refreshHomeSections();
+  }
+
+  /// Reload every network-backed discovery section, for pull-to-refresh.
+  Future<void> _refreshHomeSections() async {
+    await Future.wait([_loadTrendingTracks(), _loadNewReleases()]);
   }
 
   Future<void> _loadTrendingTracks() async {
@@ -54,8 +65,9 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final results = await _ytService.getTrendingHits(limit: 10);
       // Pre-filter to ensure only playable tracks are displayed
-      final playableResults =
-          await YouTubeAudioService().filterPlayable(results);
+      final playableResults = await YouTubeAudioService().filterPlayable(
+        results,
+      );
       if (mounted) {
         setState(() {
           _trendingTracks = playableResults;
@@ -72,7 +84,44 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _playYouTubeAudio(YouTubeMusicResult video) async {
+  /// Fetch the newest releases. Sorted by upload date upstream, so re-running
+  /// this always reflects current releases rather than returning a stale list.
+  Future<void> _loadNewReleases() async {
+    if (mounted) {
+      setState(() {
+        _isLoadingNewReleases = true;
+        _newReleasesError = null;
+      });
+    }
+
+    try {
+      final results = await _ytService.getNewReleases(limit: 5);
+      final playableResults = await YouTubeAudioService().filterPlayable(
+        results,
+      );
+      if (mounted) {
+        setState(() {
+          _newReleases = playableResults;
+          _isLoadingNewReleases = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoadingNewReleases = false;
+          _newReleasesError = 'Unable to load new releases';
+        });
+      }
+    }
+  }
+
+  /// Play [video] as part of [queue], the list it was tapped in, so
+  /// next/previous walks that list instead of the other home section.
+  Future<void> _playYouTubeAudio(
+    YouTubeMusicResult video,
+    List<YouTubeMusicResult> queue, {
+    bool isNewRelease = false,
+  }) async {
     final currentSong = _playerService.currentSong;
     final isCurrent =
         currentSong != null && currentSong.id == 'yt_${video.videoId}';
@@ -82,31 +131,52 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    setState(() => _loadingVideoId = video.videoId);
+    // Tracked separately so the tile being tapped shows its own spinner.
+    if (isNewRelease) {
+      setState(() => _loadingReleaseId = video.videoId);
+    } else {
+      setState(() => _loadingVideoId = video.videoId);
+    }
 
-    await _playerService.playYouTubeAudio(
-      video,
-      contextQueue: _trendingTracks,
-      onError: (err) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(err),
-            backgroundColor: AppTheme.error,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      },
-    );
-
-    if (mounted) {
-      setState(() => _loadingVideoId = null);
+    try {
+      await _playerService.playYouTubeAudio(
+        video,
+        contextQueue: queue,
+        onError: (err) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(err),
+              backgroundColor: AppTheme.error,
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        },
+      );
+    } finally {
+      if (mounted) {
+        // Clear only the spinner this call set. Clearing both would let a
+        // Trending tap cancel a Latest Releases tap that is still resolving.
+        setState(() {
+          if (isNewRelease) {
+            _loadingReleaseId = null;
+          } else {
+            _loadingVideoId = null;
+          }
+        });
+      }
     }
   }
 
   void _playAllTrending() {
     if (_trendingTracks.isNotEmpty) {
-      _playYouTubeAudio(_trendingTracks.first);
+      _playYouTubeAudio(_trendingTracks.first, _trendingTracks);
+    }
+  }
+
+  void _playAllNewReleases() {
+    if (_newReleases.isNotEmpty) {
+      _playYouTubeAudio(_newReleases.first, _newReleases, isNewRelease: true);
     }
   }
 
@@ -139,8 +209,8 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-   @override
-   Widget build(BuildContext context) {
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Row(
@@ -201,7 +271,7 @@ class _HomeScreenState extends State<HomeScreen> {
           return RefreshIndicator(
             color: AppTheme.primary,
             backgroundColor: AppTheme.surfaceCard,
-            onRefresh: _loadTrendingTracks,
+            onRefresh: _refreshHomeSections,
             child: ListView(
               padding: const EdgeInsets.symmetric(vertical: 8),
               children: [
@@ -286,7 +356,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 if (_isLoadingTrending)
                   _buildTrendingLoadingState()
                 else if (_trendingError != null && _trendingTracks.isEmpty)
-                  _buildTrendingErrorState()
+                  _buildSectionErrorState(_trendingError!, _loadTrendingTracks)
                 else
                   ..._trendingTracks.map((video) {
                     final isCurrentTrack =
@@ -303,25 +373,142 @@ class _HomeScreenState extends State<HomeScreen> {
                       isPlaying: isPlaying,
                       isLoading: isItemLoading,
                       isLiked: isLiked,
-                      onTap: () => _playYouTubeAudio(video),
-                      onPlay: () => _playYouTubeAudio(video),
+                      onTap: () => _playYouTubeAudio(video, _trendingTracks),
+                      onPlay: () => _playYouTubeAudio(video, _trendingTracks),
                       onLike: () => _toggleLike(video),
-                       onAddToPlaylist: () => PlaylistPickerSheet.show(
-                         context,
-                         video,
-                         _libraryService,
-                       ),
-                     );
+                      onAddToPlaylist: () => PlaylistPickerSheet.show(
+                        context,
+                        video,
+                        _libraryService,
+                      ),
+                    );
                   }),
+
+                // Section 2: Latest / New Releases (date-sorted, ~5 newest).
+                // Skipped entirely when nothing could be loaded, so the page
+                // never shows a heading with no songs under it.
+                if (_isLoadingNewReleases ||
+                    _newReleases.isNotEmpty ||
+                    _newReleasesError != null) ...[
+                  const SizedBox(height: 24),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                color: AppTheme.accentVibrant.withValues(
+                                  alpha: 0.18,
+                                ),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(
+                                  color: AppTheme.accentVibrant.withValues(
+                                    alpha: 0.4,
+                                  ),
+                                ),
+                              ),
+                              child: const Text(
+                                'NEW',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w800,
+                                  color: AppTheme.accentVibrant,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            const Text(
+                              'Latest Releases',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: AppTheme.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (_newReleases.isNotEmpty)
+                          TextButton.icon(
+                            onPressed: _playAllNewReleases,
+                            icon: const Icon(
+                              Icons.play_circle_filled_rounded,
+                              size: 18,
+                              color: AppTheme.primaryLight,
+                            ),
+                            label: const Text(
+                              'Play All',
+                              style: TextStyle(
+                                color: AppTheme.primaryLight,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  // New Release List or Skeleton Loading State
+                  if (_isLoadingNewReleases && _newReleases.isEmpty)
+                    _buildTrendingLoadingState()
+                  else if (_newReleasesError != null && _newReleases.isEmpty)
+                    _buildSectionErrorState(
+                      _newReleasesError!,
+                      _loadNewReleases,
+                    )
+                  else
+                    ..._newReleases.map((video) {
+                      final isCurrentTrack =
+                          currentSong != null &&
+                          currentSong.id == 'yt_${video.videoId}';
+                      final isPlaying = isCurrentTrack && isPlayingGlobal;
+                      final isItemLoading = _loadingReleaseId == video.videoId;
+                      final isLiked = _libraryService.isLiked(
+                        'yt_${video.videoId}',
+                      );
+
+                      return YouTubeResultTile(
+                        video: video,
+                        isPlaying: isPlaying,
+                        isLoading: isItemLoading,
+                        isLiked: isLiked,
+                        onTap: () => _playYouTubeAudio(
+                          video,
+                          _newReleases,
+                          isNewRelease: true,
+                        ),
+                        onPlay: () => _playYouTubeAudio(
+                          video,
+                          _newReleases,
+                          isNewRelease: true,
+                        ),
+                        onLike: () => _toggleLike(video),
+                        onAddToPlaylist: () => PlaylistPickerSheet.show(
+                          context,
+                          video,
+                          _libraryService,
+                        ),
+                      );
+                    }),
+                ],
 
                 const SizedBox(height: 24),
 
-                // Section 2: Liked Songs Spotlight Banner
+                // Section 3: Liked Songs Spotlight Banner
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
-                   child: InkWell(
-                      onTap: () => widget.onNavigateToLibrary(1),
-                     borderRadius: BorderRadius.circular(16),
+                  child: InkWell(
+                    onTap: () => widget.onNavigateToLibrary(1),
+                    borderRadius: BorderRadius.circular(16),
                     child: Container(
                       padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
@@ -343,7 +530,10 @@ class _HomeScreenState extends State<HomeScreen> {
                             height: 52,
                             decoration: BoxDecoration(
                               gradient: const LinearGradient(
-                                colors: [AppTheme.accentOrange, AppTheme.primary],
+                                colors: [
+                                  AppTheme.accentOrange,
+                                  AppTheme.primary,
+                                ],
                               ),
                               borderRadius: BorderRadius.circular(12),
                             ),
@@ -394,6 +584,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                 _playerService.playYouTubeAudio(
                                   likedYouTube.first,
                                   contextQueue: List.from(likedYouTube),
+                                  // Liked Songs is finite: Next plays the next
+                                  // like, never a related song.
+                                  allowRelatedExtension: false,
                                 );
                               }
                             },
@@ -406,7 +599,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                 const SizedBox(height: 24),
 
-                // Section 3: Recently Played (Only shown if user has genuine history)
+                // Section 4: Recently Played (Only shown if user has genuine history)
                 if (recentSongs.isNotEmpty) ...[
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -443,7 +636,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(height: 20),
                 ],
 
-                // Section 4: Your Playlists Carousel
+                // Section 5: Your Playlists Carousel
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16),
                   child: Row(
@@ -493,7 +686,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
                 const SizedBox(height: 20),
 
-                // Section 5: Downloads & Offline (if any exist)
+                // Section 6: Downloads & Offline (if any exist)
                 if (downloads.isNotEmpty) ...[
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -600,7 +793,10 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildTrendingErrorState() {
+  Widget _buildSectionErrorState(
+    String message,
+    Future<void> Function() retry,
+  ) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
       child: Center(
@@ -613,7 +809,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 10),
             Text(
-              _trendingError ?? 'Unable to connect to music service',
+              message,
               style: const TextStyle(
                 color: AppTheme.textSecondary,
                 fontSize: 13,
@@ -621,7 +817,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: _loadTrendingTracks,
+              onPressed: retry,
               icon: const Icon(Icons.refresh_rounded, size: 16),
               label: const Text('Retry'),
               style: OutlinedButton.styleFrom(

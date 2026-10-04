@@ -144,6 +144,363 @@ void main() {
       playerService.toggleShuffle();
       expect(playerService.isShuffle, isFalse);
     });
+
+    test('Previous restarts only past the restart threshold', () async {
+      // seek() updates currentPosition even without an audio handler, so the
+      // restart decision is observable without a real player.
+      await playerService.seek(Duration.zero);
+      expect(playerService.shouldRestartOnPrevious, isFalse);
+
+      await playerService.seek(const Duration(milliseconds: 1500));
+      expect(playerService.shouldRestartOnPrevious, isFalse);
+
+      // Exactly at the threshold counts as "a few seconds in", so it restarts.
+      await playerService.seek(PlayerService.previousRestartThreshold);
+      expect(playerService.shouldRestartOnPrevious, isTrue);
+
+      await playerService.seek(const Duration(seconds: 30));
+      expect(playerService.shouldRestartOnPrevious, isTrue);
+
+      // restartCurrent() returns to the start without leaving the restart zone.
+      await playerService.restartCurrent();
+      expect(playerService.currentPosition, Duration.zero);
+      expect(playerService.shouldRestartOnPrevious, isFalse);
+    });
+
+    test('shuffleAndPlay queues every song exactly once', () async {
+      final songs = List.generate(
+        8,
+        (i) => Song(
+          id: 'shuffle-$i',
+          title: 'Track $i',
+          artist: 'Shuffle Band',
+          album: null,
+          streamUrl: 'https://example.com/$i.mp3',
+          duration: 180,
+        ),
+      );
+
+      await playerService.shuffleAndPlay(songs);
+
+      // Shuffling must be a permutation: nothing dropped, nothing duplicated,
+      // so every song plays once before any repeat.
+      final queued = playerService.queue.map((s) => s.id).toList();
+      expect(queued.length, songs.length);
+      expect(queued.toSet().length, songs.length);
+      expect(queued.toSet(), songs.map((s) => s.id).toSet());
+
+      // Playback began on a song from that shuffled order.
+      expect(playerService.currentSong?.id, queued[playerService.currentIndex]);
+
+      // Random-per-advance must be off, otherwise next() can replay a track
+      // before the rest of the playlist has been heard.
+      expect(playerService.isShuffle, isFalse);
+
+      // The order must actually be reordered, not merely a valid permutation.
+      // Re-shuffling 5 times makes the chance of every run coincidentally
+      // matching the input order negligible, so this cannot flake.
+      final original = songs.map((s) => s.id).toList();
+      var sawDifferentOrder = false;
+      for (var i = 0; i < 5; i++) {
+        await playerService.shuffleAndPlay(songs);
+        final order = playerService.queue.map((s) => s.id).toList();
+        expect(order.length, songs.length);
+        expect(order.toSet().length, songs.length);
+        if (order.join(',') != original.join(',')) {
+          sawDifferentOrder = true;
+        }
+      }
+      expect(sawDifferentOrder, isTrue);
+    });
+
+    test('rapid next presses are all queued and processed, none dropped', () async {
+      const skipCount = 5;
+      final songs = List.generate(
+        6,
+        (i) => Song(
+          id: 'nav-$i',
+          title: 'Nav $i',
+          artist: 'Nav Band',
+          album: null,
+          streamUrl: 'https://example.com/$i.mp3',
+          duration: 180,
+          canStream: true,
+        ),
+      );
+      // Next resolves playlist items through MusicItemResolver, which requires
+      // the song to exist in the songs table and be streamable.
+      await SongDao().upsertSongs(songs);
+
+      await playerService.shuffleAndPlay(songs);
+      final startIndex = playerService.currentIndex;
+
+      // Skips fired back to back without awaiting in between. Each must be
+      // honoured: if any were dropped or coalesced the final index would differ.
+      final pending = List.generate(skipCount, (_) => playerService.next());
+      await Future.wait(pending);
+
+      expect(
+        playerService.currentIndex,
+        (startIndex + skipCount) % songs.length,
+      );
+      // Compare against the queue's own order — shuffleAndPlay permutes a copy,
+      // so currentIndex indexes the shuffled queue, not the input list.
+      final queueIds = playerService.queue.map((s) => s.id).toList();
+      expect(
+        playerService.currentSong?.id,
+        queueIds[playerService.currentIndex],
+      );
+    });
+
+    test(
+      'saved collections are finite queues that never grow with related tracks',
+      () async {
+        // Liked Songs, playlists, downloads and recents are all finite: Next
+        // must stay inside the collection rather than appending unrelated
+        // videos, which used to happen on every song.
+        final songs = List.generate(
+          3,
+          (i) => Song(
+            id: 'finite-$i',
+            title: 'Finite $i',
+            artist: 'Band',
+            album: null,
+            streamUrl: 'https://example.com/$i.mp3',
+            duration: 120,
+            canStream: true,
+          ),
+        );
+        await SongDao().upsertSongs(songs);
+
+        await playerService.setQueue(songs);
+        expect(playerService.allowsRelatedExtension, isFalse);
+
+        await playerService.shuffleAndPlay(songs);
+        expect(playerService.allowsRelatedExtension, isFalse);
+
+        await playerService.setMixedQueue([
+          PlaylistItem.fromSong(playlistId: '', song: songs.first, position: 0),
+        ]);
+        expect(playerService.allowsRelatedExtension, isFalse);
+      },
+    );
+
+    test(
+      'discovery queues keep related-track extension, liked songs do not',
+      () async {
+        final results = [
+          YouTubeMusicResult(
+            videoId: 'fin-a',
+            title: 'A',
+            channelTitle: 'Chan',
+            thumbnailUrl: '',
+            youtubeUrl: '',
+          ),
+          YouTubeMusicResult(
+            videoId: 'fin-b',
+            title: 'B',
+            channelTitle: 'Chan',
+            thumbnailUrl: '',
+            youtubeUrl: '',
+          ),
+        ];
+
+        // A search/trending/recently-played context is a discovery queue:
+        // related continuation is the expected behaviour.
+        await playerService.playYouTubeAudio(
+          results.first,
+          contextQueue: List.of(results),
+        );
+        expect(playerService.allowsRelatedExtension, isTrue);
+
+        // Liked Songs is a saved collection, so it opts out explicitly.
+        await playerService.playYouTubeAudio(
+          results.first,
+          contextQueue: List.of(results),
+          allowRelatedExtension: false,
+        );
+        expect(playerService.allowsRelatedExtension, isFalse);
+
+        // Queue-less navigation inside that finite queue must not silently flip
+        // it back on — that would make the next skip leave the collection.
+        await playerService.playYouTubeAudio(results.last);
+        expect(playerService.allowsRelatedExtension, isFalse);
+      },
+    );
+
+    test('a song played outside any playlist rebuilds the queue it navigates', () async {
+      // Regression: playing a track with no queue context kept whatever queue
+      // was already loaded, so _currentIndex pointed at a different song than
+      // the one playing and Next walked from the wrong place — appearing to do
+      // nothing on the second track.
+      final queue = List.generate(
+        3,
+        (i) => YouTubeMusicResult(
+          videoId: 'stale-$i',
+          title: 'Stale $i',
+          channelTitle: 'Chan',
+          thumbnailUrl: '',
+          youtubeUrl: '',
+        ),
+      );
+      await playerService.playYouTubeAudio(
+        queue.first,
+        contextQueue: List.of(queue),
+      );
+      expect(playerService.currentIndex, 0);
+      expect(playerService.ytQueue.length, 3);
+
+      // A track that is not in the queue at all: the queue must be rebuilt
+      // around it rather than left stale.
+      final outsider = YouTubeMusicResult(
+        videoId: 'outsider-1',
+        title: 'Outsider',
+        channelTitle: 'Chan',
+        thumbnailUrl: '',
+        youtubeUrl: '',
+      );
+      await playerService.playYouTubeAudio(outsider);
+
+      expect(playerService.ytQueue.length, 1);
+      expect(playerService.ytQueue.single.videoId, 'outsider-1');
+      expect(playerService.currentIndex, 0);
+      // Rebuilt as a discovery queue, so it can roll on to related songs.
+      expect(playerService.allowsRelatedExtension, isTrue);
+      // The mixed view must match, or the Up Next list shows the stale queue.
+      expect(playerService.mixedQueue.length, 1);
+      expect(playerService.mixedQueue.single.youtubeVideoId, 'outsider-1');
+    });
+
+    test(
+      'playing a queued track with no context moves the pointer to it',
+      () async {
+        final queue = List.generate(
+          4,
+          (i) => YouTubeMusicResult(
+            videoId: 'ptr-$i',
+            title: 'Ptr $i',
+            channelTitle: 'Chan',
+            thumbnailUrl: '',
+            youtubeUrl: '',
+          ),
+        );
+        await playerService.playYouTubeAudio(
+          queue[0],
+          contextQueue: List.of(queue),
+        );
+        expect(playerService.currentIndex, 0);
+
+        // An "Up Next" tap passes no context queue but the track is already in
+        // it. The pointer must follow the audio, so the next skip continues
+        // from the track now playing instead of from the old position.
+        await playerService.playYouTubeAudio(queue[2]);
+
+        expect(playerService.currentIndex, 2);
+        expect(playerService.ytQueue.length, 4);
+      },
+    );
+
+    test('a single video with no queue context is a discovery queue', () async {
+      await playerService.setQueue([
+        Song(
+          id: 'seed',
+          title: 'Seed',
+          artist: 'Band',
+          album: null,
+          streamUrl: 'https://example.com/seed.mp3',
+          duration: 120,
+          canStream: true,
+        ),
+      ]);
+
+      await playerService.playYouTubeAudio(
+        YouTubeMusicResult(
+          videoId: 'single-x',
+          title: 'Single',
+          channelTitle: 'Chan',
+          thumbnailUrl: '',
+          youtubeUrl: '',
+        ),
+      );
+      expect(playerService.allowsRelatedExtension, isTrue);
+    });
+
+    test(
+      'a pre-warmed stream is used instead of the related-endpoint URL',
+      () async {
+        final service = YouTubeAudioService();
+        const videoId = 'prewarm-check';
+        const warmedUrl = 'https://r1---sn-prewarmed.googlevideo.com/audio';
+        const endpointUrl = 'https://endpoint/related/audioUrl';
+
+        // The related endpoint hands back an unverified audioUrl on the result.
+        // If that won, the pre-warmed cache entry would be ignored and Next
+        // would pay a resolve — or 403 on the critical path.
+        final video = YouTubeMusicResult(
+          videoId: videoId,
+          title: 'Prewarm',
+          channelTitle: 'Chan',
+          thumbnailUrl: '',
+          youtubeUrl: '',
+          streamUrl: endpointUrl,
+        );
+
+        // Nothing cached yet: falls back to the endpoint URL, as before.
+        var song = await service.resolveToSong(video);
+        expect(song?.streamUrl, endpointUrl);
+
+        // Simulate the background pre-warm filling the cache.
+        service.cacheStreamForTesting(videoId, warmedUrl);
+
+        // Now the verified, audio-only pre-warmed URL must win.
+        song = await service.resolveToSong(video);
+        expect(song?.streamUrl, warmedUrl);
+
+        // Invalidating must clear it again, so a 403 falls back to a re-resolve
+        // instead of replaying the dead URL.
+        expect(service.peekCachedStream(videoId), isNotNull);
+        service.invalidateCache(videoId);
+        expect(service.peekCachedStream(videoId), isNull);
+      },
+    );
+  });
+
+  group('LibraryService YouTube Like Tests', () {
+    test('isLiked stays consistent when unliking from either screen', () async {
+      final library = LibraryService();
+      const videoId = 'audit-like-1';
+      const songId = 'yt_$videoId';
+
+      final video = YouTubeMusicResult(
+        videoId: videoId,
+        title: 'Like Audit',
+        channelTitle: 'Channel',
+        thumbnailUrl: '',
+        youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
+      );
+      final song = Song(
+        id: songId,
+        title: 'Like Audit',
+        artist: 'Channel',
+        album: 'YouTube Music',
+        streamUrl: '',
+        sourceUrl: 'https://www.youtube.com/watch?v=$videoId',
+        duration: 200,
+        providerId: 'youtube',
+        providerName: 'YouTube',
+      );
+
+      // Liked from a screen that goes through toggleLike (Home tiles).
+      await library.toggleLike(song);
+      expect(library.isLiked(songId), isTrue);
+
+      // Unliked from a screen that goes through toggleYouTubeLike (Search
+      // tiles). That path must clear the mirrored id too — otherwise isLiked()
+      // still reports true from _likedSongIds, leaving the heart lit and making
+      // the next tap re-like instead of unliking.
+      await library.toggleYouTubeLike(video);
+      expect(library.isLiked(songId), isFalse);
+    });
   });
 
   group('Music Provider Tests', () {

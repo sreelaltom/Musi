@@ -49,6 +49,14 @@ class _SearchScreenState extends State<SearchScreen> {
   bool _showingCachedResults = false;
   String? _loadingVideoId;
 
+  /// Recent list shown when the search field is empty — the user's most
+  /// recently searched or played songs (max 25, newest first), rendered with
+  /// the same tiles as Home so only the content differs, not the design.
+  List<YouTubeMusicResult> _recentYouTube = [];
+  List<Song> _recentSongs = [];
+  bool _isLoadingRecents = false;
+  String? _trackedSongId;
+
   final List<String> _genreTags = const [
     'Pop',
     'Rock',
@@ -62,21 +70,50 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   void initState() {
     super.initState();
+    // Seed from what is already playing, otherwise the first position tick
+    // looks like a new track and re-runs the recents query that
+    // _loadInitialResults has just done.
+    _trackedSongId = PlayerService().currentSong?.id;
     _loadInitialResults();
+    // Keep the recent list fresh when a song is played from anywhere (Home,
+    // Library, a playlist). IndexedStack keeps this screen alive, so initState
+    // alone would never fire again.
+    PlayerService().addListener(_onPlaybackChanged);
   }
 
   @override
   void dispose() {
+    PlayerService().removeListener(_onPlaybackChanged);
     _debounce?.cancel();
     _cancelToken?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
+  void _onPlaybackChanged() {
+    final songId = PlayerService().currentSong?.id;
+    if (songId == _trackedSongId) return;
+    _trackedSongId = songId;
+    // A play just happened, so the played song belongs at the top of recents.
+    if (_isShowingRecents) _loadRecents();
+  }
+
+  /// True when the user has not typed a query, i.e. the page should present
+  /// their recent songs rather than search results.
+  bool get _isShowingRecents => _searchController.text.trim().isEmpty;
+
   Future<void> _loadInitialResults() async {
     final version = ++_requestVersion;
     _cancelToken?.cancel();
     _cancelToken = CancelableToken();
+
+    // With no query the page shows the user's recent songs, not generic
+    // recommendations — the only functional difference from the Home page.
+    if (_isShowingRecents) {
+      await _loadRecents();
+      return;
+    }
+
     setState(() {
       _isLoading = true;
     });
@@ -91,7 +128,10 @@ class _SearchScreenState extends State<SearchScreen> {
             );
       if (version == _requestVersion && mounted) {
         _applyResults(results);
-        setState(() => _isLoading = false);
+        setState(() {
+          _isLoading = false;
+          _showingCachedResults = false;
+        });
       }
     } catch (error) {
       if (version == _requestVersion && mounted) {
@@ -103,6 +143,72 @@ class _SearchScreenState extends State<SearchScreen> {
         });
         debugPrint('Initial search failed: $error');
       }
+    }
+  }
+
+  /// Load the 25 most recently searched or played songs, newest first.
+  ///
+  /// Read straight from the shared music cache, so it picks up songs played
+  /// from any screen as well as anything returned by a search.
+  Future<void> _loadRecents() async {
+    if (mounted) setState(() => _isLoadingRecents = true);
+    try {
+      final entries = await _cacheDao.getRecentlySearchedOrPlayed(limit: 25);
+
+      final youtube = <YouTubeMusicResult>[];
+      final songs = <Song>[];
+      for (final entry in entries) {
+        if (entry.isYouTube) {
+          final id = entry.youtubeVideoId ?? entry.sourceId;
+          if (id.isEmpty) continue;
+          youtube.add(
+            YouTubeMusicResult(
+              videoId: id,
+              title: entry.title,
+              channelTitle: entry.artist ?? '',
+              thumbnailUrl: entry.thumbnailUrl ?? '',
+              youtubeUrl:
+                  entry.sourceUrl ?? 'https://www.youtube.com/watch?v=$id',
+              durationSeconds: entry.duration > 0 ? entry.duration : null,
+            ),
+          );
+        } else if (entry.isAuthorized) {
+          songs.add(
+            Song(
+              id: entry.sourceId,
+              title: entry.title,
+              artist: entry.artist ?? '',
+              album: entry.album,
+              artworkUrl: entry.thumbnailUrl,
+              streamUrl: entry.sourceUrl ?? '',
+              duration: entry.duration,
+              providerId: entry.provider,
+              providerName: entry.provider,
+            ),
+          );
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _recentYouTube = youtube;
+        _recentSongs = songs;
+        _isLoadingRecents = false;
+        _playableResults = [];
+        _nonPlayableResults = [];
+        _youtubeResults = [];
+      });
+      debugPrint(
+        'SearchScreen: loaded ${youtube.length + songs.length} recent songs',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isLoadingRecents = false;
+        _recentYouTube = [];
+        _recentSongs = [];
+      });
+      debugPrint('SearchScreen: could not load recent songs: $e');
     }
   }
 
@@ -137,6 +243,21 @@ class _SearchScreenState extends State<SearchScreen> {
     debugPrint(
       'SearchScreen: _performSearch called query="$cleanQuery", version=$version',
     );
+
+    // An emptied search box goes back to the recent list, not to blank search
+    // results for an empty query.
+    if (cleanQuery.isEmpty) {
+      setState(() {
+        _isLoading = false;
+        _showingCachedResults = false;
+        _playableResults = [];
+        _nonPlayableResults = [];
+        _youtubeResults = [];
+      });
+      await _loadRecents();
+      return;
+    }
+
     if (mounted) {
       setState(() {
         _isLoading = true;
@@ -147,13 +268,11 @@ class _SearchScreenState extends State<SearchScreen> {
       });
     }
 
-    // Save to search history if not empty
-    if (cleanQuery.isNotEmpty) {
-      await _historyDao.saveSearchQuery(cleanQuery);
-    }
+    // Save to search history
+    await _historyDao.saveSearchQuery(cleanQuery);
 
     // 1. Check cache first for fast results
-    if (cleanQuery.isNotEmpty && !_isOffline) {
+    if (!_isOffline) {
       final cachedEntries = await _cacheDao.searchCache(cleanQuery);
       debugPrint(
         'SearchScreen: Cache search for "$cleanQuery" returned ${cachedEntries.length} entries',
@@ -230,6 +349,7 @@ class _SearchScreenState extends State<SearchScreen> {
           youtubeUrl:
               entry.sourceUrl ??
               'https://www.youtube.com/watch?v=${entry.youtubeVideoId ?? entry.sourceId}',
+          durationSeconds: entry.duration > 0 ? entry.duration : null,
         );
         youtube.add(video);
       }
@@ -448,15 +568,17 @@ class _SearchScreenState extends State<SearchScreen> {
     try {
       await playerService.playYouTubeAudio(
         video,
-        contextQueue: _youtubeResults,
+        // Queue against whichever list the user is looking at, so next/previous
+        // walks the recent list instead of stale search results.
+        contextQueue: _isShowingRecents ? _recentYouTube : _youtubeResults,
         onError: (err) {
           if (mounted) {
-           ScaffoldMessenger.of(context).showSnackBar(
-               SnackBar(
-                 content: Text(err),
-                 backgroundColor: AppTheme.surfaceCard,
-               ),
-             );
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(err),
+                backgroundColor: AppTheme.surfaceCard,
+              ),
+            );
           }
         },
       );
@@ -490,68 +612,248 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   void _skipYouTubeVideo(YouTubeMusicResult video) {
-    // Remove from current search results
+    // Remove from the list the user is currently looking at
     setState(() {
-      _youtubeResults.removeWhere((v) => v.videoId == video.videoId);
+      if (_isShowingRecents) {
+        _recentYouTube.removeWhere((v) => v.videoId == video.videoId);
+      } else {
+        _youtubeResults.removeWhere((v) => v.videoId == video.videoId);
+      }
     });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      // Same title treatment as the Home page, so switching tabs does not feel
+      // like switching apps.
       appBar: AppBar(
-        title: const Text(
-          'Search',
-          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 24),
+        title: Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [AppTheme.primary, AppTheme.accent],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(
+                Icons.search_rounded,
+                color: Colors.white,
+                size: 20,
+              ),
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'Search',
+              style: TextStyle(
+                fontWeight: FontWeight.w800,
+                fontSize: 24,
+                color: Colors.white,
+                letterSpacing: -0.5,
+              ),
+            ),
+          ],
         ),
       ),
+      // Vertical-only padding with per-section horizontal padding, matching
+      // Home exactly instead of applying one blanket inset.
       body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+        padding: const EdgeInsets.symmetric(vertical: 8),
         children: [
           if (_isOffline) ...[
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                color: AppTheme.primary.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: AppTheme.primary.withValues(alpha: 0.35),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
                 ),
-              ),
-              child: const Text(
-                'Offline Mode: showing downloaded Musi tracks only',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: AppTheme.primaryLight,
-                  fontWeight: FontWeight.w600,
-                  fontSize: 12,
+                decoration: BoxDecoration(
+                  color: AppTheme.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: AppTheme.primary.withValues(alpha: 0.35),
+                  ),
+                ),
+                child: const Text(
+                  'Offline Mode: showing downloaded Musi tracks only',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: AppTheme.primaryLight,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12,
+                  ),
                 ),
               ),
             ),
             const SizedBox(height: 12),
           ],
-          MusiSearchBar(
-            controller: _searchController,
-            hintText: 'Search songs, artists, genres...',
-            onChanged: _onSearchChanged,
-            onSubmitted: _onSearchSubmitted,
-            onClear: _onClearSearch,
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: MusiSearchBar(
+              controller: _searchController,
+              hintText: 'Search songs, artists, genres...',
+              onChanged: _onSearchChanged,
+              onSubmitted: _onSearchSubmitted,
+              onClear: _onClearSearch,
+            ),
           ),
           const SizedBox(height: 12),
-          _buildGenreTags(),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: _buildGenreTags(),
+          ),
           const SizedBox(height: 16),
-          if (_isLoading)
+          // Recents replace search results whenever the field is empty.
+          if (_isShowingRecents)
+            ..._buildRecents()
+          // Show results as soon as any exist rather than hiding them behind the
+          // spinner for the whole network round-trip.
+          else if (_isLoading &&
+              _playableResults.isEmpty &&
+              _nonPlayableResults.isEmpty &&
+              _youtubeResults.isEmpty)
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 32),
               child: Center(child: CircularProgressIndicator()),
             )
           else
             ..._buildResults(),
-          const SizedBox(height: 110),
+          // Clearance for the mini player overlaying the bottom of the page.
+          const SizedBox(height: 100),
         ],
       ),
     );
+  }
+
+  /// The recent list, built from the same tiles as Home so only the content
+  /// differs from the Home page, not the design.
+  List<Widget> _buildRecents() {
+    if (_isLoadingRecents && _recentYouTube.isEmpty && _recentSongs.isEmpty) {
+      return const [
+        Padding(
+          padding: EdgeInsets.symmetric(vertical: 32),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      ];
+    }
+
+    final total = _recentYouTube.length + _recentSongs.length;
+    if (total == 0) {
+      return [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Column(
+            children: [
+              const SizedBox(height: 24),
+              Icon(Icons.history_rounded, size: 52, color: AppTheme.textMuted),
+              const SizedBox(height: 16),
+              const Text(
+                'No recent songs',
+                style: TextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Songs you search for or play will appear here.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
+              ),
+              const SizedBox(height: 24),
+            ],
+          ),
+        ),
+      ];
+    }
+
+    return [
+      _buildRecentHeader(total),
+      if (_recentSongs.isNotEmpty) ...[
+        _buildSectionHeader('Playable in Musi', _recentSongs.length),
+        ..._recentSongs.map(
+          (song) => SongTile(song: song, queueContext: _recentSongs),
+        ),
+      ],
+      if (_recentYouTube.isNotEmpty) ...[
+        _buildSectionHeader('YouTube Music', _recentYouTube.length),
+        ListenableBuilder(
+          listenable: Listenable.merge([PlayerService(), LibraryService()]),
+          builder: (context, _) {
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: _recentYouTube.map(_buildYouTubeTile).toList(),
+            );
+          },
+        ),
+      ],
+    ];
+  }
+
+  /// Header row mirroring Home's "Recently Played" title plus Play All action.
+  Widget _buildRecentHeader(int total) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          const Text(
+            'Recent',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              color: AppTheme.textPrimary,
+            ),
+          ),
+          if (total > 1)
+            TextButton(
+              onPressed: _playAllRecents,
+              child: const Text(
+                'Play All',
+                style: TextStyle(
+                  color: AppTheme.primaryLight,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Queue the recent list in its newest-first order and start with the top
+  /// entry, mirroring Home's Play All.
+  Future<void> _playAllRecents() async {
+    final playerService = PlayerService();
+    final queue = _recentYouTube;
+    if (queue.isEmpty) return;
+
+    try {
+      await playerService.playYouTubeAudio(
+        queue.first,
+        contextQueue: queue,
+        onError: (err) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(err),
+                backgroundColor: AppTheme.surfaceCard,
+              ),
+            );
+          }
+        },
+      );
+    } catch (e) {
+      debugPrint('SearchScreen: Play All on recents failed: $e');
+    }
   }
 
   Widget _buildGenreTags() {
@@ -600,7 +902,7 @@ class _SearchScreenState extends State<SearchScreen> {
     if (_showingCachedResults) {
       children.add(
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Text(
             'Showing cached results — fetching latest...',
             style: const TextStyle(color: AppTheme.textMuted, fontSize: 12),
@@ -610,19 +912,15 @@ class _SearchScreenState extends State<SearchScreen> {
     }
 
     if (_playableResults.isNotEmpty) {
-      children.add(
-        _buildSectionHeader('PLAYABLE IN MUSI', _playableResults.length),
-      );
       children.addAll(
         _playableResults.map(
           (song) => SongTile(song: song, queueContext: _playableResults),
         ),
       );
     } else if (_nonPlayableResults.isNotEmpty || _youtubeResults.isNotEmpty) {
-      children.add(_buildSectionHeader('PLAYABLE IN MUSI', 0));
       children.add(
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
           child: Text(
             'No authorized source found. Try YouTube results below.',
             style: const TextStyle(color: AppTheme.textMuted, fontSize: 13),
@@ -634,7 +932,7 @@ class _SearchScreenState extends State<SearchScreen> {
     if (_nonPlayableResults.isNotEmpty) {
       children.add(
         _buildSectionHeader(
-          'OTHER AUTHORIZED SOURCES',
+          'Other authorized sources',
           _nonPlayableResults.length,
         ),
       );
@@ -642,9 +940,6 @@ class _SearchScreenState extends State<SearchScreen> {
     }
 
     if (_youtubeResults.isNotEmpty) {
-      children.add(
-        _buildSectionHeader('YOUTUBE MUSIC', _youtubeResults.length),
-      );
       children.add(
         ListenableBuilder(
           listenable: Listenable.merge([PlayerService(), LibraryService()]),
@@ -780,37 +1075,40 @@ class _SearchScreenState extends State<SearchScreen> {
     );
   }
 
+  /// Section header in the Home page's style: bold 18px primary-colour title
+  /// with an optional count badge, instead of the old uppercase letter-spaced
+  /// label.
   Widget _buildSectionHeader(String title, int count) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 2),
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       child: Row(
         children: [
           Expanded(
             child: Text(
               title,
               style: const TextStyle(
-                color: AppTheme.primaryLight,
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.1,
-              ),
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-            decoration: BoxDecoration(
-              color: AppTheme.primary.withValues(alpha: 0.15),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              count.toString(),
-              style: const TextStyle(
-                color: AppTheme.primaryLight,
-                fontSize: 11,
+                fontSize: 18,
                 fontWeight: FontWeight.w700,
+                color: AppTheme.textPrimary,
               ),
             ),
           ),
+          if (count > 0)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppTheme.primary.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                count.toString(),
+                style: const TextStyle(
+                  color: AppTheme.primaryLight,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
         ],
       ),
     );

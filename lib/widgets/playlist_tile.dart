@@ -47,32 +47,29 @@ class PlaylistCard extends StatelessWidget {
                     ),
                     Positioned(
                       bottom: 8,
+                      left: 8,
+                      child: _buildCircleAction(
+                        icon: Icons.shuffle_rounded,
+                        // Secondary treatment so Play stays the primary action.
+                        background: Colors.black.withValues(alpha: 0.6),
+                        onPressed: () {
+                          if (playlist.songs.isNotEmpty) {
+                            PlayerService().shuffleAndPlay(playlist.songs);
+                          }
+                        },
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 8,
                       right: 8,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: AppTheme.primary,
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.5),
-                              blurRadius: 6,
-                            ),
-                          ],
-                        ),
-                        child: IconButton(
-                          padding: const EdgeInsets.all(6),
-                          constraints: const BoxConstraints(),
-                          icon: const Icon(
-                            Icons.play_arrow_rounded,
-                            color: Colors.white,
-                            size: 22,
-                          ),
-                          onPressed: () {
-                            if (playlist.songs.isNotEmpty) {
-                              PlayerService().setQueue(playlist.songs);
-                            }
-                          },
-                        ),
+                      child: _buildCircleAction(
+                        icon: Icons.play_arrow_rounded,
+                        background: AppTheme.primary,
+                        onPressed: () {
+                          if (playlist.songs.isNotEmpty) {
+                            PlayerService().setQueue(playlist.songs);
+                          }
+                        },
                       ),
                     ),
                   ],
@@ -100,6 +97,30 @@ class PlaylistCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// Circular overlay action on the cover art. Shared so Play and Shuffle stay
+  /// visually identical apart from their colour.
+  Widget _buildCircleAction({
+    required IconData icon,
+    required Color background,
+    required VoidCallback onPressed,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: background,
+        shape: BoxShape.circle,
+        boxShadow: [
+          BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 6),
+        ],
+      ),
+      child: IconButton(
+        padding: const EdgeInsets.all(6),
+        constraints: const BoxConstraints(),
+        icon: Icon(icon, color: Colors.white, size: 22),
+        onPressed: onPressed,
       ),
     );
   }

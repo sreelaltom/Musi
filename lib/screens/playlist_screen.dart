@@ -140,31 +140,67 @@ class PlaylistScreen extends StatelessWidget {
                             ],
                           ),
                           const Spacer(),
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: AppTheme.primary,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 20,
-                                vertical: 12,
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: AppTheme.primaryLight,
+                                  side: const BorderSide(
+                                    color: AppTheme.primary,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(24),
+                                  ),
+                                ),
+                                icon: const Icon(
+                                  Icons.shuffle_rounded,
+                                  size: 20,
+                                ),
+                                label: const Text(
+                                  'Shuffle & Play',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                                onPressed: () {
+                                  if (playlistItems.isNotEmpty) {
+                                    playerService.shuffleAndPlayPlaylist(
+                                      List<PlaylistItem>.from(playlistItems),
+                                    );
+                                  }
+                                },
                               ),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(24),
+                              const SizedBox(width: 10),
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: AppTheme.primary,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 20,
+                                    vertical: 12,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(24),
+                                  ),
+                                ),
+                                icon: const Icon(
+                                  Icons.play_arrow_rounded,
+                                  size: 24,
+                                ),
+                                label: const Text(
+                                  'Play All',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                                onPressed: () {
+                                  if (playlistItems.isNotEmpty) {
+                                    playerService.setMixedQueue(playlistItems);
+                                  }
+                                },
                               ),
-                            ),
-                            icon: const Icon(
-                              Icons.play_arrow_rounded,
-                              size: 24,
-                            ),
-                            label: const Text(
-                              'Play All',
-                              style: TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            onPressed: () {
-                              if (playlistItems.isNotEmpty) {
-                                playerService.setMixedQueue(playlistItems);
-                              }
-                            },
+                            ],
                           ),
                         ],
                       ),
@@ -344,11 +380,11 @@ class PlaylistScreen extends StatelessWidget {
         video,
         mixedContextQueue: queueContext,
       ),
-       onPlay: () => playerService.playYouTubeAudio(
-         video,
-         mixedContextQueue: queueContext,
-       ),
-       onLike: () => libraryService.toggleYouTubeLike(video),
+      onPlay: () => playerService.playYouTubeAudio(
+        video,
+        mixedContextQueue: queueContext,
+      ),
+      onLike: () => libraryService.toggleYouTubeLike(video),
       isLiked: isLiked,
       isPlaying: isPlaying,
     );

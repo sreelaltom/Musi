@@ -31,7 +31,11 @@ class _LibraryScreenState extends State<LibraryScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this, initialIndex: widget.initialTabIndex);
+    _tabController = TabController(
+      length: 5,
+      vsync: this,
+      initialIndex: widget.initialTabIndex,
+    );
     widget.tabIndexNotifier?.addListener(() {
       _tabController.index = widget.tabIndexNotifier!.value;
     });
@@ -319,7 +323,19 @@ class _LibraryScreenState extends State<LibraryScreen>
                 '${likedSongs.length} songs • ${likedYouTube.length} YouTube',
                 style: const TextStyle(color: AppTheme.textMuted),
               ),
-              if (likedSongs.isNotEmpty)
+              if (likedSongs.isNotEmpty) ...[
+                TextButton.icon(
+                  onPressed: () =>
+                      playerService.shuffleAndPlay(List<Song>.from(likedSongs)),
+                  icon: const Icon(
+                    Icons.shuffle_rounded,
+                    color: AppTheme.accent,
+                  ),
+                  label: const Text(
+                    'Shuffle',
+                    style: TextStyle(color: AppTheme.accent),
+                  ),
+                ),
                 TextButton.icon(
                   onPressed: () =>
                       playerService.setQueue(List.from(likedSongs)),
@@ -332,6 +348,7 @@ class _LibraryScreenState extends State<LibraryScreen>
                     style: TextStyle(color: AppTheme.accent),
                   ),
                 ),
+              ],
             ],
           ),
         ),
@@ -369,9 +386,18 @@ class _LibraryScreenState extends State<LibraryScreen>
                   onPressed: () => playerService.playYouTubeAudio(
                     likedYouTube.first,
                     contextQueue: List.from(likedYouTube),
+                    // Liked Songs is finite: Next plays the next like, never a
+                    // related song.
+                    allowRelatedExtension: false,
                   ),
-                  icon: const Icon(Icons.play_arrow_rounded, color: AppTheme.accent),
-                  label: const Text('Play All', style: TextStyle(color: AppTheme.accent)),
+                  icon: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: AppTheme.accent,
+                  ),
+                  label: const Text(
+                    'Play All',
+                    style: TextStyle(color: AppTheme.accent),
+                  ),
                 ),
               ],
             ),
@@ -381,11 +407,14 @@ class _LibraryScreenState extends State<LibraryScreen>
               video: video,
               isLiked: true,
               // Play as background audio (same as home screen trending)
-               onTap: () => playerService.playYouTubeAudio(
-                 video,
-                 contextQueue: List.from(likedYouTube),
-               ),
-               onLike: () => LibraryService().toggleYouTubeLike(video),
+              onTap: () => playerService.playYouTubeAudio(
+                video,
+                contextQueue: List.from(likedYouTube),
+                // Liked Songs is finite: Next plays the next like, never a
+                // related song.
+                allowRelatedExtension: false,
+              ),
+              onLike: () => LibraryService().toggleYouTubeLike(video),
             ),
           ),
         ],
@@ -467,11 +496,11 @@ class _LibraryScreenState extends State<LibraryScreen>
             (video) => YouTubeResultTile(
               video: video,
               isLiked: LibraryService().isLiked('yt_${video.videoId}'),
-               onTap: () => playerService.playYouTubeAudio(
-                 video,
-                 contextQueue: List.from(recentlyPlayedYouTube),
-               ),
-               onLike: () => LibraryService().toggleYouTubeLike(video),
+              onTap: () => playerService.playYouTubeAudio(
+                video,
+                contextQueue: List.from(recentlyPlayedYouTube),
+              ),
+              onLike: () => LibraryService().toggleYouTubeLike(video),
             ),
           ),
         ],
@@ -526,11 +555,14 @@ class _LibraryScreenState extends State<LibraryScreen>
         ...likedYouTube.map(
           (video) => YouTubeResultTile(
             video: video,
-             onTap: () => playerService.playYouTubeAudio(
-               video,
-               contextQueue: List.from(likedYouTube),
-             ),
-           ),
+            onTap: () => playerService.playYouTubeAudio(
+              video,
+              contextQueue: List.from(likedYouTube),
+              // Liked Songs is finite: Next plays the next like, never a
+              // related song.
+              allowRelatedExtension: false,
+            ),
+          ),
         ),
       ],
     );

@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 
 import '../models/song.dart';
@@ -108,28 +110,37 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
       if (song.localPath != null && await File(song.localPath!).exists()) {
         // Play local offline file — no network needed
         await _player.setAudioSource(AudioSource.file(song.localPath!));
-    } else {
-      final isYouTube =
-          song.id.startsWith('yt_') || song.providerId == 'youtube';
+      } else {
+        final isYouTube =
+            song.id.startsWith('yt_') || song.providerId == 'youtube';
 
-      // Use song-specific headers if provided (e.g. matching the extractor client),
-      // otherwise fall back to matching YouTube User-Agent.
-      // Do NOT send browser CORS headers (Origin/Referer) to googlevideo.com CDN.
-      final headers = song.headers ??
-          (isYouTube
-              ? const {
-                  'User-Agent': youtubeUserAgent,
-                }
-              : null);
+        // Use song-specific headers if provided (e.g. matching the extractor client),
+        // otherwise fall back to matching YouTube User-Agent.
+        // Do NOT send browser CORS headers (Origin/Referer) to googlevideo.com CDN.
+        final headers =
+            song.headers ??
+            (isYouTube ? const {'User-Agent': youtubeUserAgent} : null);
 
-      await _player.setAudioSource(
-        AudioSource.uri(
-          Uri.parse(song.streamUrl),
-          headers: headers,
-        ),
+        await _player.setAudioSource(
+          AudioSource.uri(Uri.parse(song.streamUrl), headers: headers),
+        );
+      }
+      // Deliberately NOT awaited.
+      //
+      // just_audio's play() returns a Future that completes only when playback
+      // COMPLETES, so awaiting it here blocked this call — and therefore
+      // PlayerService.playYouTubeAudio, and therefore the whole navigation
+      // queue — for the entire duration of the track it had just started. Every
+      // Next pressed during that time could only log "queued (N pending)" and
+      // never executed. It also deferred addRecentlyPlayed and the next-track
+      // pre-warm until the song ended, so nothing was ever stored ahead of time.
+      unawaited(
+        _player.play().catchError((Object e, StackTrace st) {
+          // Swallowed on purpose: this future completes when playback ends, and
+          // source errors are already surfaced through playbackEventStream.
+          debugPrint('MusiAudioHandler: play() completed with error: $e');
+        }),
       );
-    }
-    await _player.play();
     } catch (e) {
       rethrow;
     }
@@ -138,10 +149,45 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   @override
   // just_audio activates the audio session internally on play(); activating it
   // here as well makes the internal activation fail and reverts to paused.
-  Future<void> play() => _player.play();
+  //
+  // Also must not await: play() completes only when playback completes, so
+  // awaiting it would block PlayerService.play() — and the Repeat One branch of
+  // auto-advance — for the whole track.
+  Future<void> play() {
+    unawaited(
+      _player.play().catchError((Object e, StackTrace st) {
+        debugPrint('MusiAudioHandler: play() completed with error: $e');
+      }),
+    );
+    return Future<void>.value();
+  }
 
   @override
   Future<void> pause() => _player.pause();
+
+  /// Publish a truthful non-playing state to the MediaSession.
+  ///
+  /// `player.stop()` deactivates the ExoPlayer platform, after which
+  /// just_audio's pause()/play() early-return without emitting. If a subsequent
+  /// step fails, the session is left frozen advertising "playing" while the
+  /// AudioTrack is stopped — the notification and lock screen look alive but
+  /// nothing progresses and no track change is possible. Pushing the state
+  /// directly is the only way to unstick it.
+  Future<void> publishIdleState() async {
+    playbackState.add(
+      PlaybackState(
+        controls: const [
+          MediaControl.skipToPrevious,
+          MediaControl.pause,
+          MediaControl.skipToNext,
+        ],
+        systemActions: const {},
+        androidCompactActionIndices: const [],
+        processingState: AudioProcessingState.idle,
+        playing: false,
+      ),
+    );
+  }
 
   @override
   Future<void> stop() async {
@@ -152,18 +198,31 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   @override
   Future<void> seek(Duration position) => _player.seek(position);
 
+  /// Android dispatches the notification, lock screen, headset button and
+  /// Bluetooth controls here, and the in-app buttons call [PlayerService] the
+  /// same way, so Previous/Next share one implementation across every surface.
   @override
   Future<void> skipToNext() async {
-    if (onSkipToNext != null) {
-      await onSkipToNext!();
+    final handler = onSkipToNext;
+    if (handler == null) {
+      debugPrint(
+        'MusiAudioHandler: skipToNext ignored, PlayerService not attached yet',
+      );
+      return;
     }
+    await handler();
   }
 
   @override
   Future<void> skipToPrevious() async {
-    if (onSkipToPrevious != null) {
-      await onSkipToPrevious!();
+    final handler = onSkipToPrevious;
+    if (handler == null) {
+      debugPrint(
+        'MusiAudioHandler: skipToPrevious ignored, PlayerService not attached yet',
+      );
+      return;
     }
+    await handler();
   }
 
   Future<void> dispose() async {
