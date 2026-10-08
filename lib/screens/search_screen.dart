@@ -6,6 +6,9 @@ import 'package:url_launcher/url_launcher.dart';
 import '../database/settings_dao.dart';
 import '../database/music_cache_dao.dart';
 import '../database/search_history_dao.dart';
+import '../database/artist_mix_recent_dao.dart';
+import '../models/artist_mix_recent.dart';
+import '../models/playlist_item.dart';
 import '../models/music_cache_entry.dart';
 import '../models/music_provider.dart' show SourcePlayability;
 import '../models/search_result.dart'
@@ -13,6 +16,7 @@ import '../models/search_result.dart'
 import '../models/song.dart';
 import '../models/youtube_music_result.dart';
 import '../services/library_service.dart';
+import '../services/download_service.dart';
 import '../services/player_service.dart';
 import '../services/music_provider_manager.dart' show MusicProviderManager;
 import '../services/youtube_music_api_service.dart' show CancelableToken;
@@ -35,6 +39,7 @@ class _SearchScreenState extends State<SearchScreen> {
   final SettingsDao _settingsDao = SettingsDao();
   final MusicCacheDao _cacheDao = MusicCacheDao();
   final SearchHistoryDao _historyDao = SearchHistoryDao();
+  final ArtistMixRecentDao _artistMixRecentDao = ArtistMixRecentDao();
 
   Timer? _debounce;
   CancelableToken? _cancelToken;
@@ -44,6 +49,92 @@ class _SearchScreenState extends State<SearchScreen> {
   List<Song> _playableResults = [];
   List<Song> _nonPlayableResults = [];
   List<YouTubeMusicResult> _youtubeResults = [];
+  _ArtistMix? _buildArtistMix() {
+    final query = _artistNormalize(_searchController.text);
+    if (query.isEmpty) return null;
+
+    final songs = _playableResults;
+    String? artist;
+    // Prefer an exact artist match, then an artist name that contains the
+    // query (for channel suffixes), then infer the artist from a song match.
+    for (final song in songs) {
+      final candidate = _artistNormalize(song.artist);
+      if (candidate.isNotEmpty && candidate == query) {
+        artist = song.artist;
+        break;
+      }
+    }
+    final artistMatches = songs
+        .where((song) => _artistNormalize(song.artist).contains(query))
+        .map((song) => song.artist)
+        .toList();
+    if (artist == null && artistMatches.isNotEmpty) {
+      artist = artistMatches.first;
+    }
+    if (artist == null) {
+      for (final song in [...songs, ..._nonPlayableResults]) {
+        final title = _artistNormalize(song.title);
+        if (title.contains(query) || query.contains(title)) {
+          if (song.artist.trim().isNotEmpty) {
+            artist = song.artist;
+            break;
+          }
+        }
+      }
+    }
+
+    if (artist != null) {
+      final normalizedArtist = _artistNormalize(artist);
+      final artistSongs = songs
+          .where((song) => _artistNormalize(song.artist) == normalizedArtist)
+          .take(15)
+          .toList();
+      if (artistSongs.isNotEmpty) {
+        final artistVideos = _youtubeResults
+            .where((video) => _isArtistRelatedVideo(video, normalizedArtist))
+            .take(15 - artistSongs.length)
+            .toList();
+        return _ArtistMix(artist, songs: artistSongs, videos: artistVideos);
+      }
+    }
+
+    // YouTube channel names act as the artist identity when the provider has
+    // no authorized audio tracks for this query.
+    String? matchedChannel;
+    for (final video in _youtubeResults) {
+      final candidate = _artistNormalize(video.channelTitle);
+      if (candidate == query || candidate.contains(query)) {
+        matchedChannel = video.channelTitle.trim();
+        break;
+      }
+    }
+    if (matchedChannel == null) {
+      for (final video in _youtubeResults) {
+        if (_artistNormalize(video.title).contains(query) &&
+            video.channelTitle.trim().isNotEmpty) {
+          matchedChannel = video.channelTitle.trim();
+          break;
+        }
+      }
+    }
+    if (matchedChannel == null) return null;
+    // Use the identified channel/artist for the mix and its follow-up searches.
+    // The original query can be a song title, which otherwise searches for
+    // "<song title> songs" and leaves the collection with only one track.
+    final artistName = matchedChannel;
+    final artistKey = _artistNormalize(artistName);
+    final videos = _youtubeResults
+        .where(
+          (video) =>
+              _isArtistRelatedVideo(video, artistKey, fromArtistSearch: true),
+        )
+        .take(15)
+        .toList();
+    return videos.isEmpty ? null : _ArtistMix(artistName, videos: videos);
+  }
+
+  String _artistNormalize(String value) => _normalizeArtistName(value);
+
   bool _isLoading = false;
   bool _isOffline = false;
   bool _showingCachedResults = false;
@@ -54,6 +145,7 @@ class _SearchScreenState extends State<SearchScreen> {
   /// the same tiles as Home so only the content differs, not the design.
   List<YouTubeMusicResult> _recentYouTube = [];
   List<Song> _recentSongs = [];
+  List<ArtistMixRecent> _recentArtistMixes = [];
   bool _isLoadingRecents = false;
   String? _trackedSongId;
 
@@ -79,11 +171,13 @@ class _SearchScreenState extends State<SearchScreen> {
     // Library, a playlist). IndexedStack keeps this screen alive, so initState
     // alone would never fire again.
     PlayerService().addListener(_onPlaybackChanged);
+    ArtistMixRecentDao.revision.addListener(_onRecentMixesChanged);
   }
 
   @override
   void dispose() {
     PlayerService().removeListener(_onPlaybackChanged);
+    ArtistMixRecentDao.revision.removeListener(_onRecentMixesChanged);
     _debounce?.cancel();
     _cancelToken?.cancel();
     _searchController.dispose();
@@ -95,6 +189,10 @@ class _SearchScreenState extends State<SearchScreen> {
     if (songId == _trackedSongId) return;
     _trackedSongId = songId;
     // A play just happened, so the played song belongs at the top of recents.
+    if (_isShowingRecents) _loadRecents();
+  }
+
+  void _onRecentMixesChanged() {
     if (_isShowingRecents) _loadRecents();
   }
 
@@ -153,7 +251,12 @@ class _SearchScreenState extends State<SearchScreen> {
   Future<void> _loadRecents() async {
     if (mounted) setState(() => _isLoadingRecents = true);
     try {
-      final entries = await _cacheDao.getRecentlySearchedOrPlayed(limit: 25);
+      final results = await Future.wait([
+        _cacheDao.getRecentlySearchedOrPlayed(limit: 25),
+        _artistMixRecentDao.getRecent(limit: 10),
+      ]);
+      final entries = results[0] as List<MusicCacheEntry>;
+      final mixes = results[1] as List<ArtistMixRecent>;
 
       final youtube = <YouTubeMusicResult>[];
       final songs = <Song>[];
@@ -193,6 +296,7 @@ class _SearchScreenState extends State<SearchScreen> {
       setState(() {
         _recentYouTube = youtube;
         _recentSongs = songs;
+        _recentArtistMixes = mixes;
         _isLoadingRecents = false;
         _playableResults = [];
         _nonPlayableResults = [];
@@ -207,6 +311,7 @@ class _SearchScreenState extends State<SearchScreen> {
         _isLoadingRecents = false;
         _recentYouTube = [];
         _recentSongs = [];
+        _recentArtistMixes = [];
       });
       debugPrint('SearchScreen: could not load recent songs: $e');
     }
@@ -624,6 +729,20 @@ class _SearchScreenState extends State<SearchScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final pageContent = _isShowingRecents
+        ? _buildRecents()
+        : _isLoading &&
+              _playableResults.isEmpty &&
+              _nonPlayableResults.isEmpty &&
+              _youtubeResults.isEmpty
+        ? const <Widget>[
+            Padding(
+              padding: EdgeInsets.symmetric(vertical: 32),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          ]
+        : _buildResults();
+
     return Scaffold(
       // Same title treatment as the Home page, so switching tabs does not feel
       // like switching apps.
@@ -660,73 +779,70 @@ class _SearchScreenState extends State<SearchScreen> {
           ],
         ),
       ),
-      // Vertical-only padding with per-section horizontal padding, matching
-      // Home exactly instead of applying one blanket inset.
-      body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        children: [
-          if (_isOffline) ...[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-                decoration: BoxDecoration(
-                  color: AppTheme.primary.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(
-                    color: AppTheme.primary.withValues(alpha: 0.35),
+      // Slivers instantiate result tiles on demand, keeping long result lists
+      // responsive while scrolling and while playback state changes.
+      body: CustomScrollView(
+        slivers: [
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Column(
+                children: [
+                  if (_isOffline) ...[
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppTheme.primary.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: AppTheme.primary.withValues(alpha: 0.35),
+                          ),
+                        ),
+                        child: const Text(
+                          'Offline Mode: showing downloaded Musi tracks only',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: AppTheme.primaryLight,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    child: MusiSearchBar(
+                      controller: _searchController,
+                      hintText: 'Search songs, artists, genres...',
+                      onChanged: _onSearchChanged,
+                      onSubmitted: _onSearchSubmitted,
+                      onClear: _onClearSearch,
+                    ),
                   ),
-                ),
-                child: const Text(
-                  'Offline Mode: showing downloaded Musi tracks only',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: AppTheme.primaryLight,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 12,
+                  const SizedBox(height: 12),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: _buildGenreTags(),
                   ),
-                ),
+                  const SizedBox(height: 16),
+                ],
               ),
             ),
-            const SizedBox(height: 12),
-          ],
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: MusiSearchBar(
-              controller: _searchController,
-              hintText: 'Search songs, artists, genres...',
-              onChanged: _onSearchChanged,
-              onSubmitted: _onSearchSubmitted,
-              onClear: _onClearSearch,
-            ),
           ),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: _buildGenreTags(),
-          ),
-          const SizedBox(height: 16),
-          // Recents replace search results whenever the field is empty.
-          if (_isShowingRecents)
-            ..._buildRecents()
-          // Show results as soon as any exist rather than hiding them behind the
-          // spinner for the whole network round-trip.
-          else if (_isLoading &&
-              _playableResults.isEmpty &&
-              _nonPlayableResults.isEmpty &&
-              _youtubeResults.isEmpty)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 32),
-              child: Center(child: CircularProgressIndicator()),
-            )
-          else
-            ..._buildResults(),
+          SliverList(delegate: SliverChildListDelegate(pageContent)),
           // Clearance for the mini player overlaying the bottom of the page.
-          const SizedBox(height: 100),
+          const SliverToBoxAdapter(child: SizedBox(height: 120)),
         ],
       ),
     );
@@ -744,7 +860,8 @@ class _SearchScreenState extends State<SearchScreen> {
       ];
     }
 
-    final total = _recentYouTube.length + _recentSongs.length;
+    final total =
+        _recentArtistMixes.length + _recentYouTube.length + _recentSongs.length;
     if (total == 0) {
       return [
         Padding(
@@ -764,7 +881,7 @@ class _SearchScreenState extends State<SearchScreen> {
               ),
               const SizedBox(height: 6),
               Text(
-                'Songs you search for or play will appear here.',
+                'Songs you search for or play and artist mixes you listen to will appear here.',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
               ),
@@ -777,6 +894,10 @@ class _SearchScreenState extends State<SearchScreen> {
 
     return [
       _buildRecentHeader(total),
+      if (_recentArtistMixes.isNotEmpty) ...[
+        _buildSectionHeader('Artist mixes', _recentArtistMixes.length),
+        ..._recentArtistMixes.map(_buildRecentArtistMixTile),
+      ],
       if (_recentSongs.isNotEmpty) ...[
         _buildSectionHeader('Playable in Musi', _recentSongs.length),
         ..._recentSongs.map(
@@ -785,17 +906,62 @@ class _SearchScreenState extends State<SearchScreen> {
       ],
       if (_recentYouTube.isNotEmpty) ...[
         _buildSectionHeader('YouTube Music', _recentYouTube.length),
-        ListenableBuilder(
-          listenable: Listenable.merge([PlayerService(), LibraryService()]),
-          builder: (context, _) {
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: _recentYouTube.map(_buildYouTubeTile).toList(),
-            );
-          },
-        ),
+        ..._recentYouTube.map(_buildYouTubeTile),
       ],
     ];
+  }
+
+  Widget _buildRecentArtistMixTile(ArtistMixRecent recent) {
+    final mix = _ArtistMix(
+      recent.artist,
+      songs: recent.songs,
+      videos: recent.videos,
+    );
+    final artwork = recent.songs.isNotEmpty
+        ? recent.songs.first.artworkUrl
+        : recent.videos.first.thumbnailUrl;
+    final count = recent.songs.length + recent.videos.length;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      child: Material(
+        color: AppTheme.surfaceCard,
+        borderRadius: BorderRadius.circular(16),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) =>
+                  _ArtistMixScreen(mix: mix, allowOnlineExpansion: !_isOffline),
+            ),
+          ),
+          child: ListTile(
+            leading: artwork == null || artwork.isEmpty
+                ? const CircleAvatar(child: Icon(Icons.queue_music_rounded))
+                : ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: Image.network(
+                      artwork,
+                      width: 52,
+                      height: 52,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, _, _) => const SizedBox(
+                        width: 52,
+                        height: 52,
+                        child: Icon(Icons.queue_music_rounded),
+                      ),
+                    ),
+                  ),
+            title: Text(
+              'More from ${recent.artist}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text('$count tracks • Artist mix'),
+            trailing: const Icon(Icons.chevron_right_rounded),
+          ),
+        ),
+      ),
+    );
   }
 
   /// Header row mirroring Home's "Recently Played" title plus Play All action.
@@ -813,7 +979,7 @@ class _SearchScreenState extends State<SearchScreen> {
               color: AppTheme.textPrimary,
             ),
           ),
-          if (total > 1)
+          if (_recentYouTube.length > 1)
             TextButton(
               onPressed: _playAllRecents,
               child: const Text(
@@ -911,6 +1077,11 @@ class _SearchScreenState extends State<SearchScreen> {
       );
     }
 
+    final artistMix = _buildArtistMix();
+    if (artistMix != null) {
+      children.add(_buildArtistMixCard(artistMix));
+    }
+
     if (_playableResults.isNotEmpty) {
       children.addAll(
         _playableResults.map(
@@ -940,22 +1111,110 @@ class _SearchScreenState extends State<SearchScreen> {
     }
 
     if (_youtubeResults.isNotEmpty) {
-      children.add(
-        ListenableBuilder(
-          listenable: Listenable.merge([PlayerService(), LibraryService()]),
-          builder: (context, _) {
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: _youtubeResults
-                  .map((video) => _buildYouTubeTile(video))
-                  .toList(),
-            );
-          },
-        ),
-      );
+      children.addAll(_youtubeResults.map(_buildYouTubeTile));
     }
 
     return children;
+  }
+
+  Widget _buildArtistMixCard(_ArtistMix mix) {
+    final artwork = mix.songs.isNotEmpty
+        ? mix.songs.first.artworkUrl
+        : mix.videos.first.thumbnailUrl;
+    final count = mix.songs.length + mix.videos.length;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 14),
+      child: Material(
+        color: AppTheme.surfaceCard,
+        borderRadius: BorderRadius.circular(20),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) =>
+                  _ArtistMixScreen(mix: mix, allowOnlineExpansion: !_isOffline),
+            ),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: SizedBox(
+                    width: 64,
+                    height: 64,
+                    child: artwork == null || artwork.isEmpty
+                        ? Container(
+                            color: AppTheme.surfaceLight,
+                            child: const Icon(Icons.person_rounded, size: 32),
+                          )
+                        : Image.network(
+                            artwork,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => Container(
+                              color: AppTheme.surfaceLight,
+                              child: const Icon(Icons.person_rounded, size: 32),
+                            ),
+                          ),
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'ARTIST MIX',
+                        style: TextStyle(
+                          color: AppTheme.accent,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1.1,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'More from ${mix.artist}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppTheme.textPrimary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        count < 10
+                            ? '$count tracks • Tap to find more'
+                            : '$count tracks • Play as a collection',
+                        style: const TextStyle(
+                          color: AppTheme.textSecondary,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton.filled(
+                  tooltip: 'Play artist mix',
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => _ArtistMixScreen(
+                        mix: mix,
+                        allowOnlineExpansion: !_isOffline,
+                      ),
+                    ),
+                  ),
+                  icon: const Icon(Icons.play_arrow_rounded),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _buildNonPlayableTile(Song song) {
@@ -1020,24 +1279,60 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   Widget _buildYouTubeTile(YouTubeMusicResult video) {
-    final libraryService = LibraryService();
-    final isLiked = libraryService.likedYouTubeVideos.any(
-      (v) => v.videoId == video.videoId,
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        PlayerService(),
+        LibraryService(),
+        DownloadService(),
+      ]),
+      builder: (context, _) {
+        final libraryService = LibraryService();
+        final downloadService = DownloadService();
+        final song = _songForYouTubeVideo(video);
+        final isLiked = libraryService.likedYouTubeVideos.any(
+          (v) => v.videoId == video.videoId,
+        );
+        return YouTubeResultTile(
+          video: video,
+          onTap: () => _playYouTubeAudio(video),
+          onPlay: () => _playYouTubeAudio(video),
+          onLike: () => _toggleYouTubeLike(video),
+          onAddToPlaylist: () =>
+              PlaylistPickerSheet.show(context, video, libraryService),
+          onSkip: () => _skipYouTubeVideo(video),
+          isLiked: isLiked,
+          isPlaying: _isPlayingVideo(video.videoId),
+          isLoading: _loadingVideoId == video.videoId,
+          isDownloaded: libraryService.isDownloaded(song.id),
+          isDownloading: downloadService.isDownloading(song.id),
+          downloadProgress: downloadService.getProgress(song.id),
+          onDownload: () =>
+              libraryService.toggleDownload(song, onError: _showDownloadError),
+          onCancelDownload: () => downloadService.cancelDownload(song.id),
+          onDeleteDownload: () =>
+              libraryService.toggleDownload(song, onError: _showDownloadError),
+        );
+      },
     );
-    final isPlaying = _isPlayingVideo(video.videoId);
-    final isLoading = _loadingVideoId == video.videoId;
+  }
 
-    return YouTubeResultTile(
-      video: video,
-      onTap: () => _playYouTubeAudio(video),
-      onPlay: () => _playYouTubeAudio(video),
-      onLike: () => _toggleYouTubeLike(video),
-      onAddToPlaylist: () =>
-          PlaylistPickerSheet.show(context, video, libraryService),
-      onSkip: () => _skipYouTubeVideo(video),
-      isLiked: isLiked,
-      isPlaying: isPlaying,
-      isLoading: isLoading,
+  Song _songForYouTubeVideo(YouTubeMusicResult video) => Song(
+    id: 'yt_${video.videoId}',
+    title: video.title,
+    artist: video.channelTitle,
+    album: 'YouTube Music',
+    artworkUrl: video.thumbnailUrl,
+    streamUrl: video.streamUrl ?? '',
+    sourceUrl: video.youtubeUrl,
+    duration: video.durationSeconds ?? 0,
+    providerId: 'youtube',
+    providerName: 'YouTube',
+  );
+
+  void _showDownloadError(String error) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(error), backgroundColor: AppTheme.surfaceCard),
     );
   }
 
@@ -1127,5 +1422,302 @@ class _SearchScreenState extends State<SearchScreen> {
       case SourcePlayability.playable:
         return 'Playable';
     }
+  }
+}
+
+String _normalizeArtistName(String value) => value
+    .toLowerCase()
+    .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+    .trim()
+    .replaceAll(RegExp(r'\b([a-z])\s+([a-z])\b'), r'$1$2');
+
+bool _isArtistRelatedVideo(
+  YouTubeMusicResult video,
+  String artistKey, {
+  bool fromArtistSearch = false,
+}) {
+  final title = _normalizeArtistName(video.title);
+  final channel = _normalizeArtistName(video.channelTitle);
+  final description = _normalizeArtistName(video.description ?? '');
+  final appearsRelated =
+      channel.contains(artistKey) ||
+      title.contains(artistKey) ||
+      description.contains(artistKey);
+  if (!appearsRelated && !fromArtistSearch) return false;
+  final textToScreen = '$title $description';
+  if (const [
+    'surah',
+    'recitation',
+    'interview',
+    'trailer',
+    'teaser',
+    'news',
+    'dialog',
+    // Some search results misspell "dialogue" as "dialotrap".
+    'dialo',
+    'scene',
+    'reaction',
+    'review',
+    'speech',
+    'conversation',
+  ].any(textToScreen.contains)) {
+    return false;
+  }
+  if (textToScreen.contains('full movie')) return false;
+  final duration = video.durationSeconds;
+  // Search metadata often omits duration. Keep those artist-search matches;
+  // reject known very short clips and unusually long uploads only.
+  final musicLength = duration == null || (duration >= 75 && duration <= 1800);
+  return musicLength && (appearsRelated || fromArtistSearch);
+}
+
+class _ArtistMix {
+  final String artist;
+  final List<Song> songs;
+  final List<YouTubeMusicResult> videos;
+
+  _ArtistMix(this.artist, {this.songs = const [], this.videos = const []});
+
+  Future<void> play(PlayerService player, {bool shuffle = false}) async {
+    if (videos.isEmpty) {
+      if (shuffle) {
+        await player.shuffleAndPlay(List<Song>.from(songs));
+      } else {
+        await player.setQueue(List<Song>.from(songs));
+      }
+      return;
+    }
+    if (songs.isEmpty) {
+      final queue = List<YouTubeMusicResult>.from(videos);
+      if (shuffle) queue.shuffle();
+      await player.playYouTubeAudio(queue.first, contextQueue: queue);
+      return;
+    }
+
+    final queue = <PlaylistItem>[
+      ...songs.asMap().entries.map(
+        (entry) => PlaylistItem.fromSong(
+          playlistId: 'artist-mix',
+          song: entry.value,
+          position: entry.key,
+        ),
+      ),
+      ...videos.asMap().entries.map(
+        (entry) => PlaylistItem.fromYouTube(
+          playlistId: 'artist-mix',
+          video: entry.value,
+          position: songs.length + entry.key,
+        ),
+      ),
+    ];
+    if (queue.isEmpty) return;
+    if (shuffle) {
+      await player.shuffleAndPlayPlaylist(queue);
+    } else {
+      await player.setMixedQueue(queue);
+    }
+  }
+}
+
+class _ArtistMixScreen extends StatefulWidget {
+  final _ArtistMix mix;
+  final bool allowOnlineExpansion;
+
+  const _ArtistMixScreen({
+    required this.mix,
+    required this.allowOnlineExpansion,
+  });
+
+  @override
+  State<_ArtistMixScreen> createState() => _ArtistMixScreenState();
+}
+
+class _ArtistMixScreenState extends State<_ArtistMixScreen> {
+  late _ArtistMix _mix;
+  bool _loadingMore = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _mix = widget.mix;
+    _loadMoreArtistTracks();
+  }
+
+  Future<void> _loadMoreArtistTracks() async {
+    if (!widget.allowOnlineExpansion) return;
+    final currentCount = _mix.songs.length + _mix.videos.length;
+    if (currentCount >= 10) return;
+    setState(() => _loadingMore = true);
+    try {
+      final manager = MusicProviderManager();
+      final queryVariants = [
+        '${_mix.artist} songs',
+        '${_mix.artist} top songs',
+      ];
+      final resultBatches = await Future.wait(
+        queryVariants.map((query) => manager.searchAll(query)),
+      );
+      final results = resultBatches.expand((batch) => batch);
+      final songs = List<Song>.from(_mix.songs);
+      final videos = List<YouTubeMusicResult>.from(_mix.videos);
+      final songKeys = songs
+          .map(
+            (song) =>
+                '${song.title.toLowerCase()}|${song.artist.toLowerCase()}',
+          )
+          .toSet();
+      final videoIds = videos.map((video) => video.videoId).toSet();
+      final normalizedArtist = _normalizeArtistName(_mix.artist);
+
+      for (final result in results) {
+        if (result is SongSearchResult &&
+            _normalizeArtistName(result.song.artist)
+                .contains(normalizedArtist) &&
+            MusicProviderManager().validatePlayability(result.song) ==
+                SourcePlayability.playable) {
+          final key =
+              '${result.song.title.toLowerCase()}|${result.song.artist.toLowerCase()}';
+          if (songKeys.add(key) && songs.length + videos.length < 15) {
+            songs.add(result.song);
+          }
+        } else if (result is YouTubeSearchResult &&
+            _isArtistRelatedVideo(
+              result.video,
+              normalizedArtist,
+              fromArtistSearch: true,
+            ) &&
+            videoIds.add(result.video.videoId) &&
+            songs.length + videos.length < 15) {
+          videos.add(result.video);
+        }
+      }
+      if (mounted) {
+        setState(
+          () => _mix = _ArtistMix(_mix.artist, songs: songs, videos: videos),
+        );
+      }
+    } catch (error) {
+      debugPrint('Artist mix search failed: $error');
+    } finally {
+      if (mounted) setState(() => _loadingMore = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final player = PlayerService();
+    final library = LibraryService();
+    final mix = _mix;
+    final count = mix.songs.length + mix.videos.length;
+
+    return Scaffold(
+      appBar: AppBar(title: Text(mix.artist)),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 110),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF35230A), AppTheme.surfaceCard],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: AppTheme.borderColor),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'ARTIST MIX',
+                  style: TextStyle(
+                    color: AppTheme.accent,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.2,
+                    fontSize: 11,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  mix.artist,
+                  style: const TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _loadingMore
+                      ? '$count tracks • finding more songs…'
+                      : '$count tracks',
+                  style: const TextStyle(color: AppTheme.textSecondary),
+                ),
+                const SizedBox(height: 14),
+                Wrap(
+                  spacing: 10,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: () => _playMix(mix),
+                      icon: const Icon(Icons.play_arrow_rounded),
+                      label: const Text('Play'),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: () => _playMix(mix, shuffle: true),
+                      icon: const Icon(Icons.shuffle_rounded),
+                      label: const Text('Shuffle'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(4, 20, 4, 8),
+            child: Text(
+              'Songs',
+              style: TextStyle(
+                color: AppTheme.textPrimary,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          ...mix.songs.map(
+            (song) => SongTile(song: song, queueContext: mix.songs),
+          ),
+          ...mix.videos.map(
+            (video) => ListenableBuilder(
+              listenable: player,
+              builder: (context, _) {
+                final isCurrentTrack =
+                    player.currentYouTubeVideo?.videoId == video.videoId;
+                return YouTubeResultTile(
+                  video: video,
+                  isLiked: library.likedYouTubeVideos.any(
+                    (item) => item.videoId == video.videoId,
+                  ),
+                  isPlaying: isCurrentTrack && player.isPlaying,
+                  isLoading: isCurrentTrack && player.isBuffering,
+                  onTap: () =>
+                      player.playYouTubeAudio(video, contextQueue: mix.videos),
+                  onLike: () => library.toggleYouTubeLike(video),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _playMix(_ArtistMix mix, {bool shuffle = false}) async {
+    await mix.play(PlayerService(), shuffle: shuffle);
+    await ArtistMixRecentDao().save(
+      artist: mix.artist,
+      songs: mix.songs,
+      videos: mix.videos,
+    );
   }
 }

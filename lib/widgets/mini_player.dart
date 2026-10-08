@@ -5,7 +5,9 @@ import '../services/player_service.dart';
 import '../theme/app_theme.dart';
 
 class MiniPlayer extends StatelessWidget {
-  const MiniPlayer({super.key});
+  final GlobalKey<NavigatorState> navigatorKey;
+
+  const MiniPlayer({super.key, required this.navigatorKey});
 
   @override
   Widget build(BuildContext context) {
@@ -15,21 +17,40 @@ class MiniPlayer extends StatelessWidget {
       listenable: playerService,
       builder: (context, _) {
         final song = playerService.currentSong;
+        final video = playerService.currentYouTubeVideo;
 
-        if (song == null) {
+        if (song == null && video == null) {
           return const SizedBox.shrink();
         }
+        final displayVideo = song == null || playerService.isBuffering
+            ? video
+            : null;
 
-        return _buildMusiPlayer(context, song, playerService);
+        return _buildMusiPlayer(
+          context,
+          title: displayVideo?.title ?? song?.title ?? video?.title ?? '',
+          artist:
+              displayVideo?.channelTitle ??
+              song?.artist ??
+              video?.channelTitle ??
+              '',
+          artworkUrl:
+              displayVideo?.thumbnailUrl ??
+              song?.artworkUrl ??
+              video?.thumbnailUrl,
+          playerService: playerService,
+        );
       },
     );
   }
 
   Widget _buildMusiPlayer(
-    BuildContext context,
-    dynamic song,
-    PlayerService playerService,
-  ) {
+    BuildContext context, {
+    required String title,
+    required String artist,
+    required String? artworkUrl,
+    required PlayerService playerService,
+  }) {
     final double progress = playerService.totalDuration.inMilliseconds > 0
         ? (playerService.currentPosition.inMilliseconds /
                   playerService.totalDuration.inMilliseconds)
@@ -38,12 +59,11 @@ class MiniPlayer extends StatelessWidget {
 
     return GestureDetector(
       onTap: () {
-        showModalBottomSheet(
-          context: context,
-          isScrollControlled: true,
-          useSafeArea: true,
-          backgroundColor: Colors.transparent,
-          builder: (ctx) => const PlayerScreen(),
+        navigatorKey.currentState?.push(
+          MaterialPageRoute<void>(
+            settings: const RouteSettings(name: '/player'),
+            builder: (_) => const PlayerScreen(),
+          ),
         );
       },
       child: Container(
@@ -81,9 +101,9 @@ class MiniPlayer extends StatelessWidget {
                         width: 44,
                         height: 44,
                         color: AppTheme.surfaceLight,
-                        child: song.artworkUrl != null
+                        child: artworkUrl != null && artworkUrl.isNotEmpty
                             ? Image.network(
-                                song.artworkUrl!,
+                                artworkUrl,
                                 fit: BoxFit.cover,
                                 errorBuilder: (_, _, _) => const Icon(
                                   Icons.music_note,
@@ -105,29 +125,68 @@ class MiniPlayer extends StatelessWidget {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Text(
-                            song.title,
+                            title,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 14,
                               fontWeight: FontWeight.w600,
                               color: AppTheme.textPrimary,
+                              decoration: TextDecoration.none,
                             ),
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            song.artist,
+                            artist,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 12,
                               color: AppTheme.textSecondary,
+                              decoration: TextDecoration.none,
                             ),
                           ),
                         ],
                       ),
                     ),
                     IconButton(
+                      tooltip: playerService.isCurrentSongLiked
+                          ? 'Unlike song'
+                          : 'Like song',
+                      icon: Icon(
+                        playerService.isCurrentSongLiked
+                            ? Icons.favorite_rounded
+                            : Icons.favorite_border_rounded,
+                        color: playerService.isCurrentSongLiked
+                            ? AppTheme.accent
+                            : AppTheme.textSecondary,
+                        size: 20,
+                      ),
+                      onPressed: playerService.toggleCurrentLike,
+                      visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        minimumSize: const Size(36, 36),
+                        padding: EdgeInsets.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Previous',
+                      icon: const Icon(
+                        Icons.skip_previous_rounded,
+                        color: AppTheme.textPrimary,
+                        size: 26,
+                      ),
+                      onPressed: playerService.previous,
+                      visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        minimumSize: const Size(36, 36),
+                        padding: EdgeInsets.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: playerService.isPlaying ? 'Pause' : 'Play',
                       icon: Icon(
                         playerService.isPlaying
                             ? Icons.pause_circle_filled_rounded
@@ -136,6 +195,12 @@ class MiniPlayer extends StatelessWidget {
                         size: 34,
                       ),
                       onPressed: playerService.togglePlayPause,
+                      visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        minimumSize: const Size(36, 36),
+                        padding: EdgeInsets.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
                     ),
                     IconButton(
                       icon: const Icon(
@@ -144,6 +209,12 @@ class MiniPlayer extends StatelessWidget {
                         size: 26,
                       ),
                       onPressed: playerService.next,
+                      visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        minimumSize: const Size(36, 36),
+                        padding: EdgeInsets.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
                     ),
                   ],
                 ),

@@ -1,0 +1,2 @@
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_musi_favorite_filled,@drawable/ic_musi_favorite_outline" />

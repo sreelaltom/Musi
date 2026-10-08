@@ -21,7 +21,7 @@ import 'youtube_music_api_service.dart';
 /// and retries with a fresh URL from the next client.
 ///
 /// MULTI-CLIENT FALLBACK: Tries multiple YouTube API clients in order:
-/// android → androidSdkless → ios → mweb → androidVr
+/// androidSdkless → android → ios → mweb → androidVr
 class YouTubeAudioService {
   static const String youtubeUserAgent =
       'com.google.android.youtube/21.36.40 (Linux; U; Android 11) gzip';
@@ -330,8 +330,54 @@ class YouTubeAudioService {
     }
 
     // ── Fresh resolve (no forceRefresh) ──────────────────────────────────────
-    // Use YoutubeExplode cascade for fast start (<3s). If a song consistently
-    // 403s mid-stream, the error handler above retries with yt-dlp + next client.
+    // Resolve with the current yt-dlp Android extractor first. YouTube's newer
+    // PO-token enforcement makes the URLs emitted by the older Innertube
+    // clients frequently fail with HTTP 403 even though manifest resolution
+    // succeeds. Keep YoutubeExplode below as a bounded fallback for when the
+    // embedded extractor cannot resolve a particular video.
+    try {
+      final remainingBudget = deadline.difference(DateTime.now());
+      if (remainingBudget > Duration.zero) {
+        final streamData = await _apiService
+            .getStreamWithHeaders(videoId)
+            .timeout(
+              remainingBudget < const Duration(seconds: 24)
+                  ? remainingBudget
+                  : const Duration(seconds: 24),
+            );
+        final url = streamData?['url'] as String? ?? '';
+        if (url.isNotEmpty) {
+          final rawHeaders = streamData?['headers'];
+          final headers = rawHeaders is Map
+              ? rawHeaders.map(
+                  (key, value) => MapEntry(key.toString(), value.toString()),
+                )
+              : <String, String>{};
+          final resolved = ResolvedAudioStream(
+            url: url,
+            totalBytes: 0,
+            headers: headers,
+          );
+          _clientIndex[videoId] = 0;
+          _streamCache[videoId] = _CachedStream(
+            resolved.url,
+            resolved.totalBytes,
+            headers: resolved.headers,
+          );
+          debugPrint(
+            'YouTubeAudioService: ✅ Stream resolved via updated yt-dlp Android client for $videoId',
+          );
+          return resolved;
+        }
+      }
+    } catch (e) {
+      debugPrint(
+        'YouTubeAudioService: updated yt-dlp Android resolve failed for $videoId: $e',
+      );
+    }
+
+    // Fallback to YoutubeExplode only when the updated native extractor cannot
+    // produce a direct URL within this resolve's total time budget.
     final startIndex = _clientIndex[videoId] ?? 0;
 
     for (int i = 0; i < _allClients.length; i++) {
@@ -621,7 +667,7 @@ class YouTubeAudioService {
     if (results.isEmpty) return [];
     return results.where((v) {
       if (v.videoId.trim().isEmpty) return false;
-      if (v.title == 'Unknown' || v.title.trim().isEmpty) return false;
+      if (!v.hasUsableTitle) return false;
       if (v.durationSeconds != null && v.durationSeconds! <= 0) return false;
       return true;
     }).toList();

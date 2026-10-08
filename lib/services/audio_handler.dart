@@ -9,6 +9,15 @@ import 'package:just_audio/just_audio.dart';
 import '../models/song.dart';
 
 class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
+  /// Most Android headset buttons report every click as the same generic
+  /// media-button event. Delay its single-click action briefly so a rapid
+  /// double/triple click can be interpreted as Next/Previous. Notification,
+  /// lock-screen, and dedicated headset Next/Previous actions bypass this
+  /// timer and remain immediate.
+  static const Duration _mediaButtonMultiTapWindow = Duration(
+    milliseconds: 400,
+  );
+
   /// YouTube CDN User-Agent that matches the androidSdkless client tokens.
   /// Must be set so YouTube CDN does not block the stream request.
   static const String youtubeUserAgent =
@@ -25,9 +34,19 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   );
 
   // Callbacks for skip actions that PlayerService will set
+  Future<void> Function()? onPlay;
   Future<void> Function()? onSkipToNext;
   Future<void> Function()? onSkipToPrevious;
+  Future<void> Function()? onToggleLike;
+  bool Function()? onIsCurrentLiked;
+  Future<void> Function()? onPreviousMediaTrack;
+  Future<void> Function()? onTaskRemovedCallback;
+  Future<void> Function()? onPauseCallback;
   void Function(ProcessingState state)? onPlaybackStateChanged;
+  Timer? _mediaButtonTapTimer;
+  int _mediaButtonTapCount = 0;
+  String? _currentMediaItemId;
+  bool _currentIsLiked = false;
 
   AudioPlayer get player => _player;
 
@@ -58,9 +77,9 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
         playbackState.value.copyWith(
           controls: [
             MediaControl.skipToPrevious,
+            _likeControl,
             if (playing) MediaControl.pause else MediaControl.play,
             MediaControl.skipToNext,
-            MediaControl.stop,
           ],
           systemActions: const {
             MediaAction.seek,
@@ -93,18 +112,9 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   ///    (useProxyForRequestHeaders: false passes headers directly to
   ///     DefaultHttpDataSource → no proxy dependency on OnePlus/Media3)
   ///  - Generic remote stream via AudioSource.uri
-  Future<void> playSongItem(Song song) async {
+  Future<void> playSongItem(Song song, {Duration? startAt}) async {
     // Update system MediaItem for notification & lock screen
-    final item = MediaItem(
-      id: song.id,
-      album: song.album ?? 'Musi',
-      title: song.title,
-      artist: song.artist,
-      duration: song.duration > 0 ? Duration(seconds: song.duration) : null,
-      artUri: song.artworkUrl != null ? Uri.tryParse(song.artworkUrl!) : null,
-      extras: {'sourceUrl': song.sourceUrl, 'isDownloaded': song.isDownloaded},
-    );
-    mediaItem.add(item);
+    _publishSongMetadata(song);
 
     try {
       if (song.localPath != null && await File(song.localPath!).exists()) {
@@ -124,6 +134,9 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
         await _player.setAudioSource(
           AudioSource.uri(Uri.parse(song.streamUrl), headers: headers),
         );
+      }
+      if (startAt != null && startAt > Duration.zero) {
+        await _player.seek(startAt);
       }
       // Deliberately NOT awaited.
       //
@@ -146,6 +159,68 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
     }
   }
 
+  /// Refreshes notification and lock-screen metadata after a title is resolved.
+  void updateSongMetadata(Song song) {
+    if (_currentMediaItemId != null && _currentMediaItemId != song.id) return;
+    _publishSongMetadata(song);
+  }
+
+  void _publishSongMetadata(Song song) {
+    _currentMediaItemId = song.id;
+    _currentIsLiked = onIsCurrentLiked?.call() ?? false;
+    final item = MediaItem(
+      id: song.id,
+      album: song.album ?? 'Musi',
+      title: song.title,
+      artist: song.artist,
+      duration: song.duration > 0 ? Duration(seconds: song.duration) : null,
+      artUri: song.artworkUrl != null ? Uri.tryParse(song.artworkUrl!) : null,
+      extras: {'sourceUrl': song.sourceUrl, 'isDownloaded': song.isDownloaded},
+    );
+    mediaItem.add(item);
+    _publishLikeControlState();
+  }
+
+  MediaControl get _likeControl => MediaControl.custom(
+    androidIcon: _currentIsLiked
+        ? 'drawable/ic_musi_favorite_filled'
+        : 'drawable/ic_musi_favorite_outline',
+    label: _currentIsLiked ? 'Unlike' : 'Like',
+    name: 'toggleLike',
+  );
+
+  /// Refresh the notification and lock-screen Like action when the current
+  /// track changes or its saved state is toggled in the app.
+  void updateLikeState(bool isLiked) {
+    if (_currentIsLiked == isLiked) return;
+    _currentIsLiked = isLiked;
+    _publishLikeControlState();
+  }
+
+  void _publishLikeControlState() {
+    final state = playbackState.value;
+    playbackState.add(
+      state.copyWith(
+        controls: [
+          MediaControl.skipToPrevious,
+          _likeControl,
+          state.playing ? MediaControl.pause : MediaControl.play,
+          MediaControl.skipToNext,
+        ],
+        androidCompactActionIndices: const [0, 1, 2],
+      ),
+    );
+  }
+
+  @override
+  Future<dynamic> customAction(String name, [Map<String, dynamic>? extras]) {
+    if (name == 'toggleLike') {
+      final callback = onToggleLike;
+      return callback == null ? Future<void>.value() : callback();
+    }
+    return super.customAction(name, extras);
+  }
+
   @override
   // just_audio activates the audio session internally on play(); activating it
   // here as well makes the internal activation fail and reverts to paused.
@@ -154,6 +229,17 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   // awaiting it would block PlayerService.play() — and the Repeat One branch of
   // auto-advance — for the whole track.
   Future<void> play() {
+    final handler = onPlay;
+    if (handler != null) {
+      return handler();
+    }
+    return resumePlayer();
+  }
+
+  /// Resume a loaded source without routing back through the PlayerService
+  /// callback. PlayerService uses this only after it has checked whether a
+  /// failed/idle source needs to be resolved and loaded again.
+  Future<void> resumePlayer() {
     unawaited(
       _player.play().catchError((Object e, StackTrace st) {
         debugPrint('MusiAudioHandler: play() completed with error: $e');
@@ -163,7 +249,10 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   }
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() async {
+    await _player.pause();
+    await onPauseCallback?.call();
+  }
 
   /// Publish a truthful non-playing state to the MediaSession.
   ///
@@ -176,13 +265,14 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   Future<void> publishIdleState() async {
     playbackState.add(
       PlaybackState(
-        controls: const [
+        controls: [
           MediaControl.skipToPrevious,
+          _likeControl,
           MediaControl.pause,
           MediaControl.skipToNext,
         ],
         systemActions: const {},
-        androidCompactActionIndices: const [],
+        androidCompactActionIndices: const [0, 1, 2],
         processingState: AudioProcessingState.idle,
         playing: false,
       ),
@@ -193,6 +283,20 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
   Future<void> stop() async {
     await _player.stop();
     await super.stop();
+  }
+
+  /// A swipe-away from Android's recent-apps screen is an explicit app close.
+  /// Stop the player and clear the MediaSession so its notification and lock
+  /// screen controls do not remain after the user dismisses Musi. Pressing Home
+  /// only backgrounds the Activity and does not call this lifecycle hook, so
+  /// background playback controls continue to work normally.
+  @override
+  Future<void> onTaskRemoved() async {
+    await onTaskRemovedCallback?.call();
+    await stop();
+    mediaItem.add(null);
+    queue.add(const <MediaItem>[]);
+    await super.onTaskRemoved();
   }
 
   @override
@@ -225,7 +329,59 @@ class MusiAudioHandler extends BaseAudioHandler with SeekHandler {
     await handler();
   }
 
+  /// Count generic headset/Bluetooth button events while keeping explicit
+  /// Next/Previous events and the visible Android transport controls immediate.
+  @override
+  Future<void> click([MediaButton button = MediaButton.media]) {
+    if (button == MediaButton.next || button == MediaButton.previous) {
+      _mediaButtonTapTimer?.cancel();
+      _mediaButtonTapTimer = null;
+      _mediaButtonTapCount = 0;
+      return button == MediaButton.next ? skipToNext() : _previousMediaTrack();
+    }
+
+    _mediaButtonTapCount++;
+    _mediaButtonTapTimer?.cancel();
+    _mediaButtonTapTimer = Timer(_mediaButtonMultiTapWindow, () {
+      final taps = _mediaButtonTapCount;
+      _mediaButtonTapCount = 0;
+      _mediaButtonTapTimer = null;
+      unawaited(
+        _dispatchMediaButtonTaps(taps).catchError((
+          Object error,
+          StackTrace st,
+        ) {
+          debugPrint('MusiAudioHandler: media-button action failed: $error');
+        }),
+      );
+    });
+    return Future<void>.value();
+  }
+
+  Future<void> _dispatchMediaButtonTaps(int taps) async {
+    if (taps == 1) {
+      if (_player.playing) {
+        await pause();
+      } else {
+        await play();
+      }
+    } else if (taps == 2) {
+      await skipToNext();
+    } else if (taps >= 3) {
+      await _previousMediaTrack();
+    }
+  }
+
+  Future<void> _previousMediaTrack() {
+    // A headset triple click or a dedicated hardware Previous key means move
+    // to the prior track. The notification/lock-screen Previous button still
+    // calls skipToPrevious(), preserving its familiar restart-current rule.
+    final handler = onPreviousMediaTrack;
+    return handler == null ? skipToPrevious() : handler();
+  }
+
   Future<void> dispose() async {
+    _mediaButtonTapTimer?.cancel();
     await _player.dispose();
   }
 }

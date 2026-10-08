@@ -6,6 +6,7 @@ import '../models/playlist_item.dart';
 import '../models/youtube_music_result.dart';
 import '../services/player_service.dart';
 import '../services/library_service.dart';
+import '../services/youtube_audio_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/song_tile.dart';
 import '../widgets/youtube_result_tile.dart';
@@ -38,11 +39,13 @@ class PlaylistScreen extends StatelessWidget {
               body: CustomScrollView(
                 slivers: [
                   SliverAppBar(
-                    expandedHeight: 260,
+                    expandedHeight: 224,
                     pinned: true,
                     flexibleSpace: FlexibleSpaceBar(
                       title: Text(
                         currentPlaylist.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
@@ -113,92 +116,109 @@ class PlaylistScreen extends StatelessWidget {
                   ),
                   SliverToBoxAdapter(
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
-                      child: Row(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                          Row(
                             children: [
+                              Expanded(
+                                child: Text(
+                                  '${playlistItems.length} ${playlistItems.length == 1 ? 'song' : 'songs'}',
+                                  style: const TextStyle(
+                                    color: AppTheme.textPrimary,
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
                               Text(
-                                '${playlistItems.length} items • ${currentPlaylist.totalDurationFormatted}',
+                                currentPlaylist.totalDurationFormatted,
                                 style: const TextStyle(
                                   color: AppTheme.textSecondary,
                                   fontSize: 13,
                                 ),
                               ),
-                              const SizedBox(height: 2),
-                              const Text(
-                                'Hold & drag to reorder • Swipe to delete',
-                                style: TextStyle(
-                                  color: AppTheme.textMuted,
-                                  fontSize: 11,
-                                ),
-                              ),
                             ],
                           ),
-                          const Spacer(),
+                          const SizedBox(height: 4),
+                          const Text(
+                            'Hold and drag to reorder · Swipe left to remove',
+                            style: TextStyle(
+                              color: AppTheme.textMuted,
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
                           Row(
-                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              OutlinedButton.icon(
-                                style: OutlinedButton.styleFrom(
-                                  foregroundColor: AppTheme.primaryLight,
-                                  side: const BorderSide(
-                                    color: AppTheme.primary,
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  style: OutlinedButton.styleFrom(
+                                    foregroundColor: AppTheme.primaryLight,
+                                    side: BorderSide(
+                                      color: playlistItems.isEmpty
+                                          ? AppTheme.borderColor
+                                          : AppTheme.primary.withValues(
+                                              alpha: 0.6,
+                                            ),
+                                    ),
+                                    minimumSize: const Size.fromHeight(48),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
                                   ),
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 16,
-                                    vertical: 12,
+                                  icon: const Icon(
+                                    Icons.shuffle_rounded,
+                                    size: 20,
                                   ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(24),
+                                  label: const Text(
+                                    'Shuffle',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                   ),
+                                  onPressed: playlistItems.isEmpty
+                                      ? null
+                                      : () => playerService
+                                            .shuffleAndPlayPlaylist(
+                                              List<PlaylistItem>.from(
+                                                playlistItems,
+                                              ),
+                                            ),
                                 ),
-                                icon: const Icon(
-                                  Icons.shuffle_rounded,
-                                  size: 20,
-                                ),
-                                label: const Text(
-                                  'Shuffle & Play',
-                                  style: TextStyle(fontWeight: FontWeight.bold),
-                                ),
-                                onPressed: () {
-                                  if (playlistItems.isNotEmpty) {
-                                    playerService.shuffleAndPlayPlaylist(
-                                      List<PlaylistItem>.from(playlistItems),
-                                    );
-                                  }
-                                },
                               ),
                               const SizedBox(width: 10),
-                              ElevatedButton.icon(
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: AppTheme.primary,
-                                  foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 20,
-                                    vertical: 12,
+                              Expanded(
+                                child: FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    minimumSize: const Size.fromHeight(48),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(16),
+                                    ),
                                   ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(24),
+                                  icon: const Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 22,
                                   ),
+                                  label: const Text(
+                                    'Play all',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  onPressed: playlistItems.isEmpty
+                                      ? null
+                                      : () => playerService.setMixedQueue(
+                                          List<PlaylistItem>.from(
+                                            playlistItems,
+                                          ),
+                                        ),
                                 ),
-                                icon: const Icon(
-                                  Icons.play_arrow_rounded,
-                                  size: 24,
-                                ),
-                                label: const Text(
-                                  'Play All',
-                                  style: TextStyle(fontWeight: FontWeight.bold),
-                                ),
-                                onPressed: () {
-                                  if (playlistItems.isNotEmpty) {
-                                    playerService.setMixedQueue(playlistItems);
-                                  }
-                                },
                               ),
                             ],
                           ),
@@ -239,59 +259,77 @@ class PlaylistScreen extends StatelessWidget {
                         },
                         itemBuilder: (context, index) {
                           final item = playlistItems[index];
-                          return Dismissible(
+                          return Padding(
                             key: ValueKey(
-                              '${currentPlaylist.id}_${item.sourceType.value}_${item.sourceId}',
+                              'reorder_${currentPlaylist.id}_'
+                              '${item.sourceType.value}_${item.sourceId}',
                             ),
-                            direction: DismissDirection.endToStart,
-                            background: Container(
-                              alignment: Alignment.centerRight,
-                              padding: const EdgeInsets.only(right: 20),
-                              color: AppTheme.error,
-                              child: const Icon(
-                                Icons.delete,
-                                color: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 4,
+                            ),
+                            child: Dismissible(
+                              key: ValueKey(
+                                '${currentPlaylist.id}_${item.sourceType.value}_${item.sourceId}',
                               ),
-                            ),
-                            onDismissed: (_) {
-                              if (item.isAuthorized) {
-                                libraryService.removeSongFromPlaylist(
-                                  currentPlaylist.id,
-                                  item.sourceId,
-                                );
-                              } else {
-                                libraryService.removeYouTubeFromPlaylist(
-                                  currentPlaylist.id,
-                                  item.sourceId,
-                                );
-                              }
-                            },
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: item.isAuthorized
-                                      ? _buildAuthorizedSongTile(
-                                          item,
-                                          playlistItems,
-                                        )
-                                      : _buildYouTubeTile(
-                                          context,
-                                          item,
-                                          playlistItems,
-                                        ),
+                              direction: DismissDirection.endToStart,
+                              background: Container(
+                                alignment: Alignment.centerRight,
+                                padding: const EdgeInsets.only(right: 20),
+                                decoration: BoxDecoration(
+                                  color: AppTheme.error,
+                                  borderRadius: BorderRadius.circular(18),
                                 ),
-                                ReorderableDragStartListener(
-                                  index: index,
-                                  child: const Padding(
-                                    padding: EdgeInsets.only(right: 12),
-                                    child: Icon(
-                                      Icons.drag_handle_rounded,
-                                      color: AppTheme.textMuted,
-                                      size: 20,
+                                child: const Icon(
+                                  Icons.delete_outline_rounded,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              onDismissed: (_) {
+                                if (item.isAuthorized) {
+                                  libraryService.removeSongFromPlaylist(
+                                    currentPlaylist.id,
+                                    item.sourceId,
+                                  );
+                                } else {
+                                  libraryService.removeYouTubeFromPlaylist(
+                                    currentPlaylist.id,
+                                    item.sourceId,
+                                  );
+                                }
+                              },
+                              child: Material(
+                                color: AppTheme.surfaceCard,
+                                borderRadius: BorderRadius.circular(18),
+                                clipBehavior: Clip.antiAlias,
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: item.isAuthorized
+                                          ? _buildAuthorizedSongTile(
+                                              item,
+                                              playlistItems,
+                                            )
+                                          : _buildYouTubeTile(
+                                              context,
+                                              item,
+                                              playlistItems,
+                                            ),
                                     ),
-                                  ),
+                                    ReorderableDragStartListener(
+                                      index: index,
+                                      child: const Padding(
+                                        padding: EdgeInsets.only(right: 12),
+                                        child: Icon(
+                                          Icons.drag_handle_rounded,
+                                          color: AppTheme.textMuted,
+                                          size: 20,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                              ],
+                              ),
                             ),
                           );
                         },
@@ -369,24 +407,55 @@ class PlaylistScreen extends StatelessWidget {
     final isLiked = libraryService.likedYouTubeVideos.any(
       (v) => v.videoId == video.videoId,
     );
-    final isPlaying =
-        playerService.isPlaying &&
-        (playerService.currentSong?.id == 'yt_${video.videoId}' ||
-            playerService.currentYouTubeVideo?.videoId == video.videoId);
 
-    return YouTubeResultTile(
-      video: video,
-      onTap: () => playerService.playYouTubeAudio(
-        video,
-        mixedContextQueue: queueContext,
-      ),
-      onPlay: () => playerService.playYouTubeAudio(
-        video,
-        mixedContextQueue: queueContext,
-      ),
-      onLike: () => libraryService.toggleYouTubeLike(video),
-      isLiked: isLiked,
-      isPlaying: isPlaying,
+    // PlaylistScreen's item FutureBuilder is driven by library changes, but
+    // playback state changes independently. Listen here so the active track
+    // and its Play/Pause control update immediately when playback starts,
+    // pauses, resumes, or advances.
+    return ListenableBuilder(
+      listenable: playerService,
+      builder: (context, _) {
+        // A YouTube stream may leave the previously resolved Song in
+        // currentSong while currentYouTubeVideo already points at the new
+        // track. Treat the active YouTube video as authoritative in that
+        // case, otherwise two playlist rows can appear active after Next.
+        final activeYouTubeVideo = playerService.currentYouTubeVideo;
+        final activeSong = playerService.currentSong;
+        final activeSongVideoId = activeSong == null
+            ? null
+            : YouTubeAudioService.extractVideoId(activeSong);
+        final isCurrentTrack = activeSongVideoId != null
+            ? activeSongVideoId == video.videoId
+            : activeYouTubeVideo != null
+            ? activeYouTubeVideo.videoId == video.videoId
+            : activeSong?.id == item.sourceId;
+        final isPlaying = isCurrentTrack && playerService.isPlaying;
+
+        void activateTrack() {
+          if (isCurrentTrack) {
+            if (playerService.isPlaying) {
+              playerService.pause();
+            } else {
+              playerService.play();
+            }
+          } else {
+            playerService.playYouTubeAudio(
+              video,
+              mixedContextQueue: queueContext,
+            );
+          }
+        }
+
+        return YouTubeResultTile(
+          video: video,
+          onTap: activateTrack,
+          onPlay: activateTrack,
+          onLike: () => libraryService.toggleYouTubeLike(video),
+          isLiked: isLiked,
+          isPlaying: isPlaying,
+          isLoading: isCurrentTrack && playerService.isBuffering,
+        );
+      },
     );
   }
 

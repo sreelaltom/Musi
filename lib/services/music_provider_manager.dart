@@ -240,7 +240,7 @@ class MusicProviderManager extends ChangeNotifier {
     }
   }
 
-   Future<List<SearchResult>> _safeSearchYouTube(
+  Future<List<SearchResult>> _safeSearchYouTube(
     String query, {
     CancelableToken? cancelable,
   }) async {
@@ -381,17 +381,13 @@ class MusicProviderManager extends ChangeNotifier {
     }
   }
 
-   Future<List<SearchResult>> _safeFeaturedYouTube({
+  Future<List<SearchResult>> _safeFeaturedYouTube({
     CancelableToken? cancelable,
   }) async {
     try {
-      final videos = await _youtubeService.searchTracks(
-        'music',
-        limit: 25,
-      );
+      final videos = await _youtubeService.searchTracks('music', limit: 25);
       // Pre-filter to ensure only playable results reach the page
-      final playableVideos =
-          await YouTubeAudioService().filterPlayable(videos);
+      final playableVideos = await YouTubeAudioService().filterPlayable(videos);
       debugPrint(
         'MusicProviderManager: ${playableVideos.length}/${videos.length} '
         'featured YouTube results are playable',
@@ -473,6 +469,9 @@ class MusicProviderManager extends ChangeNotifier {
   }
 
   SourcePlayability validatePlayability(Song song) {
+    if (song.localPath != null && song.localPath!.isNotEmpty) {
+      return SourcePlayability.playable;
+    }
     if (!song.canStream) {
       return SourcePlayability.notPlayableUnknownLicense;
     }

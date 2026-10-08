@@ -119,7 +119,9 @@ class MusicCacheEntry {
       artist: song.artist,
       album: song.album,
       thumbnailUrl: song.artworkUrl,
-      sourceUrl: song.sourceUrl,
+      // Search recents reconstruct a playable Song from this value, so keep
+      // the resolved provider stream URL here rather than the external page URL.
+      sourceUrl: song.streamUrl.isNotEmpty ? song.streamUrl : song.sourceUrl,
       provider: provider,
       duration: song.duration,
       cachedAt: DateTime.now(),

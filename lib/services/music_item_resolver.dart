@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
 import '../models/playlist_item.dart';
@@ -60,7 +62,29 @@ class MusicItemResolver extends ChangeNotifier {
 
   /// Resolve an authorized song for playback
   Future<PlaybackResolution> _resolveAuthorizedSong(String songId) async {
-    final song = await _songDao.getSongById(songId);
+    var song = await _songDao.getSongById(songId);
+    if (song == null) {
+      // Search results are stored in music_cache before they are added to the
+      // user's library. Artist mixes can queue those songs alongside YouTube
+      // items, so resolve the cached playable stream as a fallback.
+      final cached = await _cacheDao.getCacheEntry(
+        CachedSourceType.authorized,
+        songId,
+      );
+      if (cached != null && cached.sourceUrl?.isNotEmpty == true) {
+        song = Song(
+          id: cached.sourceId,
+          title: cached.title,
+          artist: cached.artist ?? '',
+          album: cached.album,
+          artworkUrl: cached.thumbnailUrl,
+          streamUrl: cached.sourceUrl!,
+          duration: cached.duration,
+          providerId: cached.provider,
+          providerName: cached.provider,
+        );
+      }
+    }
     if (song == null) {
       return PlaybackResolution.unavailable('Song not found in database');
     }
@@ -87,6 +111,15 @@ class MusicItemResolver extends ChangeNotifier {
   Future<PlaybackResolution> _resolveYouTubeVideo(String videoId) async {
     if (videoId.isEmpty) {
       return PlaybackResolution.unavailable('Invalid YouTube video ID');
+    }
+
+    final downloaded = await _songDao.getSongById('yt_$videoId');
+    final localPath = downloaded?.localPath;
+    if (downloaded != null &&
+        localPath != null &&
+        localPath.isNotEmpty &&
+        await File(localPath).exists()) {
+      return PlaybackResolution.forPlayerService(downloaded);
     }
 
     // Check if cached
@@ -151,13 +184,22 @@ class MusicItemResolver extends ChangeNotifier {
   Future<PlaybackResolution> resolveYouTubeVideo(
     YouTubeMusicResult video,
   ) async {
+    final downloaded = await _songDao.getSongById('yt_${video.videoId}');
+    final localPath = downloaded?.localPath;
+    if (downloaded != null &&
+        localPath != null &&
+        localPath.isNotEmpty &&
+        await File(localPath).exists()) {
+      await _cacheDao.updateLastPlayed(CachedSourceType.youtube, video.videoId);
+      return PlaybackResolution.forPlayerService(downloaded);
+    }
     await _cacheDao.updateLastPlayed(CachedSourceType.youtube, video.videoId);
     try {
       final song = await YouTubeAudioService().resolveToSong(video);
       if (song != null) {
         return PlaybackResolution.forPlayerService(song);
       }
-     } catch (_) {}
+    } catch (_) {}
     return PlaybackResolution.unavailable(
       'Unable to resolve YouTube audio stream. The video may not be playable.',
     );

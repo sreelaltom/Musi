@@ -1,10 +1,16 @@
+import 'dart:io';
+import 'dart:async';
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:musi/database/song_dao.dart';
 import 'package:musi/database/playlist_dao.dart';
 import 'package:musi/database/settings_dao.dart';
 import 'package:musi/database/music_cache_dao.dart';
 import 'package:musi/database/search_history_dao.dart';
+import 'package:musi/database/artist_mix_recent_dao.dart';
 import 'package:musi/database/youtube_likes_dao.dart';
 import 'package:musi/models/song.dart';
 import 'package:musi/models/playlist.dart';
@@ -16,6 +22,9 @@ import 'package:musi/services/library_service.dart';
 import 'package:musi/services/jamendo_music_service.dart';
 import 'package:musi/services/music_item_resolver.dart';
 import 'package:musi/services/youtube_audio_service.dart';
+import 'package:musi/services/download_service.dart';
+import 'package:musi/services/youtube_music_api_service.dart';
+import 'package:musi/services/song_deep_link_service.dart';
 
 void main() {
   setUpAll(() {
@@ -23,6 +32,132 @@ void main() {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   });
+
+  test('YouTube titles reject blank and unknown placeholders', () {
+    expect(YouTubeMusicResult.isUsableTitle('Unknown Title'), isFalse);
+    expect(YouTubeMusicResult.isUsableTitle('Unknown Channel'), isFalse);
+    expect(YouTubeMusicResult.isUsableTitle('Unknown Song'), isFalse);
+    expect(YouTubeMusicResult.isUsableTitle(' UNKNOWN '), isFalse);
+    expect(YouTubeMusicResult.isUsableTitle('  '), isFalse);
+    expect(YouTubeMusicResult.isUsableTitle('Blue Monday'), isTrue);
+  });
+
+  test('Musi custom song links parse valid IDs and reject invalid links', () {
+    const id = 'dQw4w9WgXcQ';
+    expect(SongDeepLinkService.parseVideoId(Uri.parse('musi://s/$id')), id);
+    expect(
+      SongDeepLinkService.parseVideoId(Uri.parse('musi://s/not-valid')),
+      isNull,
+    );
+    expect(
+      SongDeepLinkService.parseVideoId(Uri.parse('https://example.com/s/$id')),
+      isNull,
+    );
+  });
+
+  test('restored YouTube song reuses its saved queue metadata', () {
+    const storedSong = Song(
+      id: 'yt_video-123',
+      title: 'Unknown Title',
+      artist: 'Unknown Channel',
+      artworkUrl: '',
+      streamUrl: '',
+    );
+    const queuedVideo = YouTubeMusicResult(
+      videoId: 'video-123',
+      title: 'Known Song',
+      channelTitle: 'Known Artist',
+      thumbnailUrl: 'https://example.test/art.jpg',
+      youtubeUrl: 'https://www.youtube.com/watch?v=video-123',
+    );
+
+    final restored = PlayerService.mergeRestoredTrackMetadata(
+      storedSong,
+      queuedVideo,
+    );
+
+    expect(restored.title, 'Known Song');
+    expect(restored.artist, 'Known Artist');
+    expect(restored.artworkUrl, queuedVideo.thumbnailUrl);
+  });
+
+  test('YouTube oEmbed metadata restores title, artist, and artwork', () {
+    final result = YouTubeMusicResult.fromOEmbed('video-123', {
+      'title': 'Known Song',
+      'author_name': 'Known Artist',
+      'thumbnail_url': 'https://example.test/art.jpg',
+    });
+
+    expect(result?.title, 'Known Song');
+    expect(result?.channelTitle, 'Known Artist');
+    expect(result?.thumbnailUrl, 'https://example.test/art.jpg');
+    expect(
+      YouTubeMusicResult.fromOEmbed('video-123', {'title': 'Unknown Title'}),
+      isNull,
+    );
+  });
+
+  test('new release candidates stay ordered by newest published date', () {
+    final oldest = YouTubeMusicResult(
+      videoId: 'old-release',
+      title: 'Older clean song',
+      channelTitle: 'Artist',
+      thumbnailUrl: '',
+      publishedAt: DateTime(2026, 1, 1),
+      youtubeUrl: 'https://www.youtube.com/watch?v=old-release',
+    );
+    final newest = YouTubeMusicResult(
+      videoId: 'new-release',
+      title: 'Newest clean song',
+      channelTitle: 'Artist',
+      thumbnailUrl: '',
+      publishedAt: DateTime(2026, 10, 8),
+      youtubeUrl: 'https://www.youtube.com/watch?v=new-release',
+    );
+    const undated = YouTubeMusicResult(
+      videoId: 'undated-release',
+      title: 'Undated clean song',
+      channelTitle: 'Artist',
+      thumbnailUrl: '',
+      youtubeUrl: 'https://www.youtube.com/watch?v=undated-release',
+    );
+
+    expect(
+      YouTubeMusicApiService.sortNewReleaseCandidates([oldest, undated, newest])
+          .map((song) => song.videoId),
+      ['new-release', 'old-release', 'undated-release'],
+    );
+  });
+
+  test(
+    'playback recent history updates immediately and keeps unique songs',
+    () async {
+      final library = LibraryService();
+      const first = Song(
+        id: 'home-recent-sync-first',
+        title: 'First Recent Track',
+        artist: 'Recent Test Artist',
+        streamUrl: 'https://example.com/recent-first.mp3',
+      );
+      const second = Song(
+        id: 'home-recent-sync-second',
+        title: 'Second Recent Track',
+        artist: 'Recent Test Artist',
+        streamUrl: 'https://example.com/recent-second.mp3',
+      );
+
+      await library.addRecentlyPlayed(first);
+      expect(library.recentlyPlayed.first.id, first.id);
+      await library.addRecentlyPlayed(second);
+      await library.addRecentlyPlayed(first);
+
+      final history = library.recentlyPlayed
+          .where((song) => song.id.startsWith('home-recent-sync-'))
+          .toList();
+      expect(history.map((song) => song.id).toList(), [first.id, second.id]);
+      expect(await SongDao().getRecentlyPlayed(), isNotEmpty);
+    },
+  );
 
   group('SQLite DAOs Unit Tests', () {
     final songDao = SongDao();
@@ -61,6 +196,33 @@ void main() {
       await songDao.addRecentlyPlayed(testSong);
       final recent = await songDao.getRecentlyPlayed();
       expect(recent.any((s) => s.id == 'test-unit-1'), isTrue);
+    });
+
+    test('Artist mixes are saved and restored in recent plays', () async {
+      final mixDao = ArtistMixRecentDao();
+      const video = YouTubeMusicResult(
+        videoId: 'mix-video-1',
+        title: 'Mix Video',
+        channelTitle: 'Dart Test Band',
+        thumbnailUrl: 'https://example.com/cover.jpg',
+        youtubeUrl: 'https://www.youtube.com/watch?v=mix-video-1',
+        durationSeconds: 190,
+      );
+
+      await mixDao.save(
+        artist: 'Dart Test Band',
+        songs: [testSong],
+        videos: [video],
+      );
+
+      final recent = await mixDao.getRecent();
+      final savedMix = recent.firstWhere(
+        (mix) => mix.artist == 'Dart Test Band',
+      );
+      expect(savedMix.songs.single.id, testSong.id);
+      expect(savedMix.songs.single.streamUrl, testSong.streamUrl);
+      expect(savedMix.videos.single.videoId, video.videoId);
+      expect(savedMix.videos.single.durationSeconds, video.durationSeconds);
     });
 
     test(
@@ -123,6 +285,92 @@ void main() {
     );
   });
 
+  test(
+    'DownloadService saves, verifies, and removes a downloaded song',
+    () async {
+      final documentsDirectory = await Directory.systemTemp.createTemp(
+        'musi_download_test_',
+      );
+      final audioBytes = List<int>.generate(64, (index) => index);
+      var requestCount = 0;
+
+      final song = Song(
+        id: 'download-service-unit-test',
+        title: 'Download Service Fixture',
+        artist: 'Test Artist',
+        streamUrl: 'https://fixture.example/fixture.mp3',
+        duration: 10,
+        providerId: 'jamendo',
+        canDownload: true,
+      );
+
+      try {
+        final songDao = SongDao();
+        await songDao.upsertSong(song);
+        final downloads = DownloadService.forTesting(
+          clientFactory: () => _FixtureDownloadClient(audioBytes, () {
+            requestCount++;
+          }),
+          downloadsDirectoryProvider: () async => documentsDirectory,
+        );
+        expect(downloads.canDownloadSong(song), isTrue);
+        expect(await downloads.downloadSong(song), isTrue);
+        expect(requestCount, 1);
+
+        final downloaded = await songDao.getSongById(song.id);
+        expect(downloaded?.isDownloaded, isTrue);
+        expect(downloaded?.localPath, isNotNull);
+        final audioFile = File(downloaded!.localPath!);
+        expect(await audioFile.exists(), isTrue);
+        expect(await audioFile.readAsBytes(), audioBytes);
+        expect(await downloads.isDownloaded(song), isTrue);
+
+        expect(await downloads.deleteDownload(song), isTrue);
+        expect(await audioFile.exists(), isFalse);
+        final removed = await songDao.getSongById(song.id);
+        expect(removed?.isDownloaded, isFalse);
+        expect(removed?.localPath, isNull);
+      } finally {
+        await documentsDirectory.delete(recursive: true);
+      }
+    },
+  );
+
+  test('unknown-length download never reports a false 0 percent', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'musi_unknown_download_test_',
+    );
+    const song = Song(
+      id: 'download-unknown-length-test',
+      title: 'Unknown Length Fixture',
+      artist: 'Test Artist',
+      streamUrl: 'https://fixture.example/unknown.mp3',
+      duration: 10,
+      providerId: 'jamendo',
+      canDownload: true,
+    );
+    final client = _UnknownLengthDownloadClient();
+    try {
+      await SongDao().upsertSong(song);
+      final downloads = DownloadService.forTesting(
+        clientFactory: () => client,
+        downloadsDirectoryProvider: () async => directory,
+      );
+      final pendingDownload = downloads.downloadSong(song);
+      await client.requestStarted.future;
+      await Future<void>.delayed(Duration.zero);
+      expect(downloads.isDownloading(song.id), isTrue);
+      expect(downloads.hasKnownProgress(song.id), isFalse);
+      client.body.add([1, 2, 3, 4]);
+      await client.body.close();
+      expect(await pendingDownload, isTrue);
+      expect(await downloads.isDownloaded(song), isTrue);
+    } finally {
+      client.close();
+      await directory.delete(recursive: true);
+    }
+  });
+
   group('PlayerService Logic Tests', () {
     final playerService = PlayerService();
 
@@ -166,6 +414,62 @@ void main() {
       expect(playerService.currentPosition, Duration.zero);
       expect(playerService.shouldRestartOnPrevious, isFalse);
     });
+
+    test(
+      'resolved YouTube playlist song keeps its original mixed-queue slot',
+      () async {
+        await SettingsDao().setOfflineMode(false);
+        const firstVideo = YouTubeMusicResult(
+          videoId: 'mix-first',
+          title: 'First',
+          channelTitle: 'Mix Artist',
+          thumbnailUrl: '',
+          youtubeUrl: 'https://www.youtube.com/watch?v=mix-first',
+        );
+        const secondVideo = YouTubeMusicResult(
+          videoId: 'mix-second',
+          title: 'Second',
+          channelTitle: 'Mix Artist',
+          thumbnailUrl: '',
+          youtubeUrl: 'https://www.youtube.com/watch?v=mix-second',
+        );
+        final items = [
+          PlaylistItem.fromYouTube(
+            playlistId: 'mixed-youtube-test',
+            video: firstVideo,
+            position: 0,
+          ),
+          PlaylistItem.fromYouTube(
+            playlistId: 'mixed-youtube-test',
+            video: secondVideo,
+            position: 1,
+          ),
+        ];
+        const resolvedFirstSong = Song(
+          id: 'yt_mix-first',
+          title: 'First',
+          artist: 'Mix Artist',
+          streamUrl: 'https://example.com/first.m4a',
+          duration: 180,
+          providerId: 'youtube',
+          sourceUrl: 'https://www.youtube.com/watch?v=mix-first',
+        );
+
+        await playerService.playSong(
+          resolvedFirstSong,
+          mixedContextQueue: items,
+        );
+
+        expect(playerService.currentIndex, 0);
+        expect(playerService.mixedQueue, hasLength(2));
+        expect(playerService.mixedQueue.map((item) => item.sourceId).toList(), [
+          'mix-first',
+          'mix-second',
+        ]);
+        expect(playerService.currentSong?.id, 'yt_mix-first');
+        expect(playerService.allowsRelatedExtension, isTrue);
+      },
+    );
 
     test('shuffleAndPlay queues every song exactly once', () async {
       final songs = List.generate(
@@ -213,6 +517,84 @@ void main() {
       expect(sawDifferentOrder, isTrue);
     });
 
+    test('smart shuffle spreads artists and queues each track once', () {
+      final songs = [
+        for (var i = 0; i < 4; i++)
+          Song(
+            id: 'smart-a-$i',
+            title: 'A $i',
+            artist: 'Artist A',
+            streamUrl: 'https://example.com/a$i.mp3',
+          ),
+        for (var i = 0; i < 3; i++)
+          Song(
+            id: 'smart-b-$i',
+            title: 'B $i',
+            artist: 'Artist B',
+            streamUrl: 'https://example.com/b$i.mp3',
+          ),
+        Song(
+          id: 'smart-c',
+          title: 'C',
+          artist: 'Artist C',
+          streamUrl: 'https://example.com/c.mp3',
+        ),
+      ];
+      final ordered = PlayerService.smartShuffleOrder(
+        songs,
+        recentlyPlayed: songs.take(2).toList(),
+        random: Random(7),
+      );
+      expect(
+        ordered.map((song) => song.id).toSet(),
+        songs.map((song) => song.id).toSet(),
+      );
+      expect(ordered, hasLength(songs.length));
+      for (var index = 1; index < ordered.length; index++) {
+        expect(ordered[index].artist, isNot(ordered[index - 1].artist));
+      }
+    });
+
+    test(
+      'shuffle playlist starts at the beginning of shuffled finite queue',
+      () async {
+        final songs = List.generate(
+          6,
+          (i) => Song(
+            id: 'mixed-shuffle-$i',
+            title: 'Track $i',
+            artist: 'Shuffle Band',
+            album: null,
+            streamUrl: 'https://example.com/$i.mp3',
+            duration: 180,
+          ),
+        );
+        final items = songs
+            .asMap()
+            .entries
+            .map(
+              (entry) => PlaylistItem.fromSong(
+                playlistId: 'mixed-shuffle-test',
+                song: entry.value,
+                position: entry.key,
+              ),
+            )
+            .toList();
+        await SongDao().upsertSongs(songs);
+
+        await playerService.shuffleAndPlayPlaylist(items);
+
+        final queuedIds = playerService.mixedQueue
+            .map((item) => item.sourceId)
+            .toList();
+        expect(queuedIds.length, items.length);
+        expect(queuedIds.toSet(), items.map((item) => item.sourceId).toSet());
+        expect(playerService.currentIndex, 0);
+        expect(playerService.currentSong?.id, queuedIds.first);
+        expect(playerService.allowsRelatedExtension, isTrue);
+      },
+    );
+
     test('rapid next presses are all queued and processed, none dropped', () async {
       const skipCount = 5;
       final songs = List.generate(
@@ -253,11 +635,10 @@ void main() {
     });
 
     test(
-      'saved collections are finite queues that never grow with related tracks',
+      'saved collections keep their order and continue into related tracks',
       () async {
-        // Liked Songs, playlists, downloads and recents are all finite: Next
-        // must stay inside the collection rather than appending unrelated
-        // videos, which used to happen on every song.
+        // Saved items remain first in their original order, then related
+        // tracks can extend playback once the collection ends.
         final songs = List.generate(
           3,
           (i) => Song(
@@ -273,20 +654,94 @@ void main() {
         await SongDao().upsertSongs(songs);
 
         await playerService.setQueue(songs);
-        expect(playerService.allowsRelatedExtension, isFalse);
+        expect(playerService.allowsRelatedExtension, isTrue);
 
         await playerService.shuffleAndPlay(songs);
-        expect(playerService.allowsRelatedExtension, isFalse);
+        expect(playerService.allowsRelatedExtension, isTrue);
 
         await playerService.setMixedQueue([
           PlaylistItem.fromSong(playlistId: '', song: songs.first, position: 0),
         ]);
-        expect(playerService.allowsRelatedExtension, isFalse);
+        expect(playerService.allowsRelatedExtension, isTrue);
       },
     );
 
     test(
-      'discovery queues keep related-track extension, liked songs do not',
+      'authorized search queue replaces stale YouTube navigation state',
+      () async {
+        final songs = List.generate(
+          3,
+          (i) => Song(
+            id: 'search-song-$i',
+            title: 'Search song $i',
+            artist: 'Search Artist',
+            streamUrl: 'https://example.com/search-$i.mp3',
+            duration: 120,
+            canStream: true,
+          ),
+        );
+        await SongDao().upsertSongs(songs);
+        await playerService.playYouTubeAudio(
+          YouTubeMusicResult(
+            videoId: 'old-video',
+            title: 'Old',
+            channelTitle: 'Old artist',
+            thumbnailUrl: '',
+            youtubeUrl: '',
+          ),
+        );
+
+        await playerService.playSong(songs[1], contextQueue: songs);
+
+        expect(playerService.currentIndex, 1);
+        expect(playerService.queue.map((song) => song.id), [
+          'search-song-0',
+          'search-song-1',
+          'search-song-2',
+        ]);
+        expect(playerService.ytQueue, isEmpty);
+        expect(playerService.mixedQueue.map((item) => item.sourceId), [
+          'search-song-0',
+          'search-song-1',
+          'search-song-2',
+        ]);
+        expect(playerService.allowsRelatedExtension, isTrue);
+      },
+    );
+
+    test('standalone authorized song clears a stale saved queue', () async {
+      final staleQueue = List.generate(
+        2,
+        (i) => Song(
+          id: 'stale-authorized-$i',
+          title: 'Stale $i',
+          artist: 'Stale Artist',
+          streamUrl: 'https://example.com/stale-$i.mp3',
+          duration: 120,
+          canStream: true,
+        ),
+      );
+      final selected = Song(
+        id: 'standalone-authorized',
+        title: 'Standalone',
+        artist: 'New Artist',
+        streamUrl: 'https://example.com/standalone.mp3',
+        duration: 120,
+        canStream: true,
+      );
+      await SongDao().upsertSongs([...staleQueue, selected]);
+      await playerService.setQueue(staleQueue);
+
+      await playerService.playSong(selected);
+
+      expect(playerService.queue.map((song) => song.id), [selected.id]);
+      expect(playerService.currentIndex, 0);
+      expect(playerService.mixedQueue.single.sourceId, selected.id);
+      expect(playerService.allowsRelatedExtension, isTrue);
+    });
+
+    test(
+      'discovery and saved YouTube queues allow related-track extension',
       () async {
         final results = [
           YouTubeMusicResult(
@@ -313,18 +768,16 @@ void main() {
         );
         expect(playerService.allowsRelatedExtension, isTrue);
 
-        // Liked Songs is a saved collection, so it opts out explicitly.
+        // Liked Songs plays its saved order first, then continues with related.
         await playerService.playYouTubeAudio(
           results.first,
           contextQueue: List.of(results),
-          allowRelatedExtension: false,
         );
-        expect(playerService.allowsRelatedExtension, isFalse);
+        expect(playerService.allowsRelatedExtension, isTrue);
 
-        // Queue-less navigation inside that finite queue must not silently flip
-        // it back on — that would make the next skip leave the collection.
+        // Queue-less navigation preserves the active continuation policy.
         await playerService.playYouTubeAudio(results.last);
-        expect(playerService.allowsRelatedExtension, isFalse);
+        expect(playerService.allowsRelatedExtension, isTrue);
       },
     );
 
@@ -690,6 +1143,30 @@ void main() {
       final resolver2 = MusicItemResolver();
       expect(identical(resolver1, resolver2), isTrue);
     });
+
+    test('cached search tracks can play in a mixed artist queue', () async {
+      const searchedSong = Song(
+        id: 'cached-mix-song',
+        title: 'Cached Mix Song',
+        artist: 'Dart Test Band',
+        streamUrl: 'https://example.com/cached-mix.mp3',
+        duration: 200,
+      );
+      await MusicCacheDao().upsertCacheEntry(
+        MusicCacheEntry.fromSong(song: searchedSong, provider: 'test'),
+      );
+
+      final resolution = await MusicItemResolver().resolvePlaylistItem(
+        PlaylistItem.fromSong(
+          playlistId: 'artist-mix',
+          song: searchedSong,
+          position: 0,
+        ),
+      );
+
+      expect(resolution.isAvailable, isTrue);
+      expect(resolution.song?.streamUrl, searchedSong.streamUrl);
+    });
   });
 
   group('YouTube Audio Service and Background Playback Integration Tests', () {
@@ -801,4 +1278,39 @@ void main() {
       );
     });
   });
+}
+
+class _FixtureDownloadClient extends http.BaseClient {
+  final List<int> bytes;
+  final void Function() onRequest;
+
+  _FixtureDownloadClient(this.bytes, this.onRequest);
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    onRequest();
+    return http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      200,
+      contentLength: bytes.length,
+      headers: const {'content-type': 'audio/mpeg'},
+      request: request,
+    );
+  }
+}
+
+class _UnknownLengthDownloadClient extends http.BaseClient {
+  final StreamController<List<int>> body = StreamController<List<int>>();
+  final Completer<void> requestStarted = Completer<void>();
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    if (!requestStarted.isCompleted) requestStarted.complete();
+    return http.StreamedResponse(
+      body.stream,
+      200,
+      headers: const {'content-type': 'audio/mpeg'},
+      request: request,
+    );
+  }
 }

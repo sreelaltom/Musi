@@ -7,7 +7,7 @@ class MusiDatabase {
   static final MusiDatabase instance = MusiDatabase._init();
   static Database? _database;
 
-  static const int _databaseVersion = 4;
+  static const int _databaseVersion = 5;
 
   MusiDatabase._init();
 
@@ -189,6 +189,8 @@ class MusiDatabase {
     await db.execute('''
       CREATE INDEX idx_playlist_items_playlist ON playlist_items(playlist_id)
     ''');
+
+    await _createRecentArtistMixes(db);
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -381,6 +383,24 @@ class MusiDatabase {
         CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist ON playlist_items(playlist_id)
       ''');
     }
+    if (oldVersion < 5) {
+      await _createRecentArtistMixes(db);
+    }
+  }
+
+  Future<void> _createRecentArtistMixes(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS recent_artist_mixes (
+        mix_id TEXT PRIMARY KEY,
+        artist TEXT NOT NULL,
+        tracks_json TEXT NOT NULL,
+        played_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE INDEX IF NOT EXISTS idx_recent_artist_mixes_played
+      ON recent_artist_mixes(played_at)
+    ''');
   }
 
   Future<void> close() async {

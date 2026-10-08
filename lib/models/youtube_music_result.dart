@@ -29,6 +29,26 @@ class YouTubeMusicResult {
 
   bool get isYouTube => sourceType == MusicSourceType.youtube;
   bool get hasStreamUrl => streamUrl != null && streamUrl!.isNotEmpty;
+  bool get hasUsableTitle => isUsableTitle(title);
+
+  static bool isUsableTitle(String? value) {
+    final normalized = value?.trim().toLowerCase() ?? '';
+    return normalized.isNotEmpty &&
+        !const {
+          'unknown',
+          'unknown title',
+          'unknown song',
+          'unknown track',
+          'unknown channel',
+          'untitled',
+          'untitled video',
+          'video',
+          'youtube video',
+          'title unavailable',
+          'n/a',
+          'null',
+        }.contains(normalized);
+  }
 
   String? get durationFormatted {
     final seconds = durationSeconds;
@@ -158,6 +178,27 @@ class YouTubeMusicResult {
           (map['youtube_url'] as String?) ??
           'https://www.youtube.com/watch?v=$videoId',
       sourceType: MusicSourceType.youtube,
+    );
+  }
+
+  /// Builds a video result from YouTube's oEmbed response.
+  /// Returns null when the provider did not return a real title.
+  static YouTubeMusicResult? fromOEmbed(
+    String videoId,
+    Map<String, dynamic> response,
+  ) {
+    final title = response['title'];
+    if (title is! String || !isUsableTitle(title)) return null;
+    final author = response['author_name'];
+    final thumbnail = response['thumbnail_url'];
+    return YouTubeMusicResult(
+      videoId: videoId,
+      title: title.trim(),
+      channelTitle: author is String && isUsableTitle(author)
+          ? author.trim()
+          : 'YouTube',
+      thumbnailUrl: thumbnail is String ? thumbnail : '',
+      youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
     );
   }
 

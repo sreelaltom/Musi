@@ -29,6 +29,7 @@ class LibraryService extends ChangeNotifier {
   List<Playlist> _playlists = [];
   final List<PlaylistItem> _allPlaylistItems = [];
   bool _isInitialized = false;
+  Future<void>? _initialization;
 
   bool get isInitialized => _isInitialized;
   List<Song> _likedSongs = [];
@@ -45,7 +46,14 @@ class LibraryService extends ChangeNotifier {
   List<Playlist> get playlists => List.unmodifiable(_playlists);
 
   // Initialize and load persistent data from SQLite
-  Future<void> init() async {
+  Future<void> init() {
+    if (_isInitialized) return Future<void>.value();
+    return _initialization ??= _loadPersistentData().whenComplete(() {
+      _initialization = null;
+    });
+  }
+
+  Future<void> _loadPersistentData() async {
     try {
       // 1. Load Liked Songs
       _likedSongs = await _songDao.getLikedSongs();
@@ -194,9 +202,17 @@ class LibraryService extends ChangeNotifier {
 
   // Toggle Download with real file download and verification
   Future<void> toggleDownload(Song song, {Function(String)? onError}) async {
-    final alreadyDownloaded = await _downloadService.isDownloaded(song);
+    final storedSong = await _songDao.getSongById(song.id);
+    final downloadRecord = storedSong ?? song;
+    final alreadyDownloaded = await _downloadService.isDownloaded(
+      downloadRecord,
+    );
     if (alreadyDownloaded) {
-      await _downloadService.deleteDownload(song);
+      final deleted = await _downloadService.deleteDownload(downloadRecord);
+      if (!deleted) {
+        onError?.call('Could not delete the downloaded audio.');
+        return;
+      }
       _downloadedSongIds.remove(song.id);
       _downloadedSongs.removeWhere((s) => s.id == song.id);
       notifyListeners();
@@ -230,6 +246,28 @@ class LibraryService extends ChangeNotifier {
     notifyListeners();
 
     await _songDao.addRecentlyPlayed(song);
+  }
+
+  /// Correct stale metadata on a history row without changing its play date.
+  Future<void> updateRecentlyPlayedMetadata(Song song) async {
+    final index = _recentlyPlayed.indexWhere((item) => item.id == song.id);
+    if (index < 0) {
+      _recentlyPlayed = await _songDao.getRecentlyPlayed();
+    } else {
+      _recentlyPlayed[index] = song;
+    }
+    final refreshedIndex = _recentlyPlayed.indexWhere(
+      (item) => item.id == song.id,
+    );
+    if (refreshedIndex >= 0) _recentlyPlayed[refreshedIndex] = song;
+    _likedSongs = _likedSongs
+        .map((item) => item.id == song.id ? song : item)
+        .toList();
+    _downloadedSongs = _downloadedSongs
+        .map((item) => item.id == song.id ? song : item)
+        .toList();
+    await _songDao.upsertSong(song);
+    notifyListeners();
   }
 
   // Add to Recently Played (YouTube video)

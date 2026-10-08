@@ -1,0 +1,48 @@
+How Album Art URLs Are Obtained
+The system uses multiple methods to fetch high-quality album art, with fallback strategies if certain methods fail. The key methods are:
+
+_get_album_art_unified() (Main Entry Point)
+
+Decides which method to use based on the requested ThumbnailQuality.
+
+For HIGH and VERY_HIGH quality, it tries multiple sources in order:
+
+YouTube Music API (get_youtube_music_album_art())
+
+yt-dlp Metadata Extraction (get_hq_album_art_from_ytdlp())
+
+Fallback to Thumbnails (from song_data if no HQ art is found)
+
+For LOW and MEDIUM quality, it directly uses thumbnails from song_data.
+
+get_youtube_music_album_art() (YouTube Music API)
+
+Uses self.ytmusic.get_song(video_id) to fetch metadata.
+
+Extracts thumbnails and picks the highest resolution square image (preferred for album art).
+
+Falls back to the highest resolution thumbnail if no square image is found.
+
+get_hq_album_art_from_ytdlp() (yt-dlp Metadata Scraping)
+
+Uses yt-dlp to extract metadata from the YouTube video page.
+
+First tries to get album art from embedded metadata (e.g., album_art, artwork fields).
+
+If not found, falls back to high-resolution thumbnails (≥720×720).
+
+Prefers square thumbnails (aspect ratio close to 1:1).
+
+Fallback to song_data Thumbnails
+
+If no HQ album art is found, it falls back to the thumbnails provided in song_data.
+
+Modifies the thumbnail URL to the requested size:
+
+LOW → w60-h60
+
+MED → w120-h120
+
+HIGH → w320-h320
+
+VERY_HIGH → w544-h544

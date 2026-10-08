@@ -1,17 +1,20 @@
 import 'package:flutter/material.dart';
 
+import '../models/song.dart';
 import '../models/youtube_music_result.dart';
 import '../services/library_service.dart';
 import '../theme/app_theme.dart';
 
 /// Bottom sheet for selecting a playlist to add a YouTube video to.
 class PlaylistPickerSheet extends StatelessWidget {
-  final YouTubeMusicResult video;
+  final YouTubeMusicResult? video;
+  final Song? song;
   final LibraryService libraryService;
 
   const PlaylistPickerSheet({
     super.key,
-    required this.video,
+    this.video,
+    this.song,
     required this.libraryService,
   });
 
@@ -22,8 +25,22 @@ class PlaylistPickerSheet extends StatelessWidget {
   ) async {
     await showModalBottomSheet<void>(
       context: context,
+      useRootNavigator: true,
       builder: (ctx) =>
           PlaylistPickerSheet(video: video, libraryService: libraryService),
+    );
+  }
+
+  static Future<void> showSong(
+    BuildContext context,
+    Song song,
+    LibraryService libraryService,
+  ) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      useRootNavigator: true,
+      builder: (ctx) =>
+          PlaylistPickerSheet(song: song, libraryService: libraryService),
     );
   }
 
@@ -58,7 +75,7 @@ class PlaylistPickerSheet extends StatelessWidget {
             ),
             const SizedBox(height: 4),
             Text(
-              video.title,
+              song?.title ?? video?.title ?? 'Now Playing',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 13, color: AppTheme.textMuted),
@@ -113,10 +130,19 @@ class PlaylistPickerSheet extends StatelessWidget {
                           ),
                         ),
                         onTap: () async {
-                          await libraryService.addYouTubeToPlaylist(
-                            playlist.id,
-                            video,
-                          );
+                          final currentSong = song;
+                          final currentVideo = video;
+                          if (currentSong != null) {
+                            await libraryService.addSongToPlaylist(
+                              playlist.id,
+                              currentSong,
+                            );
+                          } else if (currentVideo != null) {
+                            await libraryService.addYouTubeToPlaylist(
+                              playlist.id,
+                              currentVideo,
+                            );
+                          }
                           if (context.mounted) {
                             Navigator.pop(context);
                             ScaffoldMessenger.of(context).showSnackBar(

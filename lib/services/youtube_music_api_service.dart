@@ -1,8 +1,13 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt_exp;
 import 'package:yt_flutter_musicapi/yt_flutter_musicapi.dart';
 import 'package:yt_flutter_musicapi/yt_flutter_musicapi_platform_interface.dart';
 
+import '../database/music_cache_dao.dart';
+import '../models/music_cache_entry.dart';
 import '../models/youtube_music_result.dart';
 
 /// Token for cancelling in-flight search requests
@@ -25,10 +30,21 @@ class YouTubeMusicApiService {
   YouTubeMusicApiService._internal();
 
   YtFlutterMusicapi? _api;
+  final MusicCacheDao _musicCacheDao = MusicCacheDao();
   bool _isInitialized = false;
+  Future<void>? _initialization;
+  final Map<String, YouTubeMusicResult> _videoDetailsCache = {};
+  final Map<String, Future<YouTubeMusicResult?>> _videoDetailsInFlight = {};
 
   /// Initialize the YouTube Music API (Android-only, requires Chaquopy Python bridge)
-  Future<void> initialize() async {
+  Future<void> initialize() {
+    if (_isInitialized) return Future<void>.value();
+    return _initialization ??= _initialize().whenComplete(() {
+      _initialization = null;
+    });
+  }
+
+  Future<void> _initialize() async {
     try {
       _api = YtFlutterMusicapi();
       final response = await _api!.initialize(country: 'US');
@@ -98,7 +114,9 @@ class YouTubeMusicApiService {
         final durationStr = item.duration;
         final thumbnail = item.albumArt;
 
-        if (videoId.isEmpty || title == 'Unknown') continue;
+        if (videoId.isEmpty || !YouTubeMusicResult.isUsableTitle(title)) {
+          continue;
+        }
 
         // Parse duration (format: "MM:SS" or "HH:MM:SS")
         final durationSeconds = _parseDuration(durationStr);
@@ -158,7 +176,9 @@ class YouTubeMusicApiService {
       for (final v in search) {
         final secs = v.duration?.inSeconds ?? 0;
         // Filter for individual songs between 1.5 min and 8 min
-        if (secs >= 90 && secs <= 480) {
+        if (secs >= 90 &&
+            secs <= 480 &&
+            YouTubeMusicResult.isUsableTitle(v.title)) {
           tracks.add(
             YouTubeMusicResult(
               videoId: v.id.value,
@@ -192,14 +212,6 @@ class YouTubeMusicApiService {
     caseSensitive: false,
   );
 
-  /// Titles matching these look like an actual single release, so they are
-  /// preferred over other clean uploads. Deliberately does not include
-  /// "lyric": [_releaseNoise] already discards those.
-  static final RegExp _releaseHint = RegExp(
-    r'(official|music\s*video|\bmv\b|audio|visualizer)',
-    caseSensitive: false,
-  );
-
   /// Non-alphanumerics used to build a de-duplication key for song titles.
   static final RegExp _titleNoise = RegExp(r'[^\w\s]');
 
@@ -215,27 +227,38 @@ class YouTubeMusicApiService {
     // covers and other non-releases still leaves enough genuine new songs.
     const candidates = 30;
 
-    // 1. Date-sorted search. This is what keeps the section dynamic.
-    for (final query in const ['official audio', 'new song release']) {
-      final results = await _searchByUploadDate(query, limit: candidates);
-      final picked = _pickNewReleases(results, limit);
-      if (picked.isNotEmpty) return picked;
-    }
+    // 1. Date-sorted searches. Merge before selecting so a result from the
+    // second query can outrank an older result from the first query.
+    final batches = await Future.wait([
+      for (final query in const ['official audio', 'new song release'])
+        _searchByUploadDate(query, limit: candidates),
+    ]);
+    final results = sortNewReleaseCandidates(
+      batches.expand((batch) => batch).toList(),
+    );
+    final picked = _pickNewReleases(results, limit);
+    if (picked.isNotEmpty) return picked;
 
-    // 2. Fallback: bridge relevance search. Not date-sorted, but still a live
-    // query rather than a hardcoded list.
+    // 2. Fallback to the music bridge if YouTube's date-filter endpoint is
+    // unavailable. Ask for current-year and recent releases, merge and de-dupe
+    // them, so the section still has fresh candidates instead of disappearing.
     if (_api == null || !_isInitialized) {
       await initialize();
     }
     if (_api == null || !_isInitialized) return [];
 
     try {
-      final results = await searchTracks(
-        'new releases',
-        limit: candidates,
-        includeAudioUrl: false,
-      );
-      return _pickNewReleases(results, limit);
+      final year = DateTime.now().year;
+      final batches = await Future.wait([
+        for (final query in [
+          'new songs $year',
+          'latest songs $year',
+          'new music videos $year',
+        ])
+          searchTracks(query, limit: candidates, includeAudioUrl: false),
+      ]);
+      final results = batches.expand((batch) => batch).toList();
+      return _pickNewReleases(sortNewReleaseCandidates(results), limit);
     } catch (e) {
       debugPrint(
         'YouTubeMusicApiService: getNewReleases bridge search failed: $e',
@@ -265,13 +288,18 @@ class YouTubeMusicApiService {
       for (final v in search) {
         final secs = v.duration?.inSeconds ?? 0;
         // Individual songs only: skip shorts, long mixes and livestreams.
-        if (secs < 90 || secs > 480) continue;
+        if (secs < 90 ||
+            secs > 480 ||
+            !YouTubeMusicResult.isUsableTitle(v.title)) {
+          continue;
+        }
         tracks.add(
           YouTubeMusicResult(
             videoId: v.id.value,
             title: v.title,
             channelTitle: v.author,
             thumbnailUrl: v.thumbnails.mediumResUrl,
+            publishedAt: v.uploadDate,
             youtubeUrl: 'https://www.youtube.com/watch?v=${v.id.value}',
             durationSeconds: secs,
           ),
@@ -289,19 +317,41 @@ class YouTubeMusicApiService {
     }
   }
 
-  /// Keep the newest uploads that look like actual releases, de-duplicated by
-  /// song title. Titles that look like a release come first; if that runs short,
-  /// other clean uploads fill the remaining slots.
+  /// Sort by actual publish date, keeping dated uploads ahead of results with
+  /// missing dates. Retain source order when dates tie or are unavailable.
+  @visibleForTesting
+  static List<YouTubeMusicResult> sortNewReleaseCandidates(
+    List<YouTubeMusicResult> results,
+  ) {
+    final indexed = List.generate(
+      results.length,
+      (index) => MapEntry(index, results[index]),
+    );
+    indexed.sort((a, b) {
+      final aDate = a.value.publishedAt;
+      final bDate = b.value.publishedAt;
+      final byDate = switch ((aDate, bDate)) {
+        (null, null) => 0,
+        (null, _) => 1,
+        (_, null) => -1,
+        (final aDate?, final bDate?) => bDate.compareTo(aDate),
+      };
+      return byDate == 0 ? a.key.compareTo(b.key) : byDate;
+    });
+    return indexed.map((entry) => entry.value).toList();
+  }
+
+  /// Keep the newest clean song uploads, de-duplicated by normalized title.
   List<YouTubeMusicResult> _pickNewReleases(
     List<YouTubeMusicResult> results,
     int limit,
   ) {
-    final preferred = <YouTubeMusicResult>[];
-    final fallback = <YouTubeMusicResult>[];
+    final picked = <YouTubeMusicResult>[];
     final seenTitles = <String>{};
 
     for (final video in results) {
-      if (preferred.length >= limit) break;
+      if (picked.length >= limit) break;
+      if (!video.hasUsableTitle) continue;
       if (_releaseNoise.hasMatch(video.title)) continue;
 
       final key = video.title
@@ -311,14 +361,10 @@ class YouTubeMusicApiService {
           .trim();
       if (key.isEmpty || !seenTitles.add(key)) continue;
 
-      if (_releaseHint.hasMatch(video.title)) {
-        preferred.add(video);
-      } else if (fallback.length < limit) {
-        fallback.add(video);
-      }
+      picked.add(video);
     }
 
-    return [...preferred, ...fallback].take(limit).toList();
+    return picked;
   }
 
   /// Get stream URL for a YouTube Music video via yt-dlp fast audio endpoint
@@ -376,59 +422,130 @@ class YouTubeMusicApiService {
 
   /// Get video details by searching for the video
   Future<YouTubeMusicResult?> getVideoDetails(String videoId) async {
-    if (_api == null || !_isInitialized) return null;
+    if (videoId.trim().isEmpty) return null;
+    final id = videoId.trim();
+    final cached = _videoDetailsCache[id];
+    if (cached != null) return cached;
+    final existing = _videoDetailsInFlight[id];
+    if (existing != null) return existing;
 
+    final request = _fetchVideoDetails(id);
+    _videoDetailsInFlight[id] = request;
     try {
-      // Search for the video by its ID using a broad query
-      // The package doesn't have a direct getVideoDetails endpoint,
-      // so we search and find by videoId
-      final response = await _api!.searchMusic(
-        query: videoId,
-        limit: 10,
-        includeAudioUrl: false,
-        includeAlbumArt: true,
-      );
+      final details = await request;
+      if (details != null) _videoDetailsCache[id] = details;
+      return details;
+    } finally {
+      _videoDetailsInFlight.remove(id);
+    }
+  }
 
-      if (!response.success || response.data == null) {
-        debugPrint(
-          'YouTubeMusicApiService: getVideoDetails search failed: ${response.error}',
-        );
-        return null;
-      }
-
-      // Find the matching video by ID
-      for (final item in response.data!) {
-        if (item.videoId == videoId) {
-          final title = item.title;
-          final artist = item.artists;
-          final durationStr = item.duration;
-          final thumbnail = item.albumArt;
-
-          final durationSeconds = _parseDuration(durationStr) ?? 0;
-
-          return YouTubeMusicResult(
-            videoId: videoId,
-            title: title,
-            channelTitle: artist,
-            thumbnailUrl: thumbnail ?? '',
-            youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
-            durationSeconds: durationSeconds,
-          );
-        }
-      }
-
-      // Fallback: return basic info if video not found in search
+  Future<YouTubeMusicResult?> _fetchVideoDetails(String videoId) async {
+    final cached = await _musicCacheDao.getCacheEntry(
+      CachedSourceType.youtube,
+      videoId,
+    );
+    if (YouTubeMusicResult.isUsableTitle(cached?.title)) {
       return YouTubeMusicResult(
         videoId: videoId,
-        title: 'Unknown Title',
-        channelTitle: 'Unknown Channel',
-        thumbnailUrl: '',
+        title: cached!.title.trim(),
+        channelTitle: YouTubeMusicResult.isUsableTitle(cached.artist)
+            ? cached.artist!.trim()
+            : 'YouTube',
+        thumbnailUrl: cached.thumbnailUrl ?? '',
+        youtubeUrl:
+            cached.sourceUrl ?? 'https://www.youtube.com/watch?v=$videoId',
+        durationSeconds: cached.duration > 0 ? cached.duration : null,
+      );
+    }
+
+    try {
+      final oEmbedUri = Uri.https('www.youtube.com', '/oembed', {
+        'url': 'https://www.youtube.com/watch?v=$videoId',
+        'format': 'json',
+      });
+      final response = await http
+          .get(
+            oEmbedUri,
+            headers: const {
+              'Accept': 'application/json',
+              'User-Agent': 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36',
+            },
+          )
+          .timeout(const Duration(seconds: 8));
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map<String, dynamic>) {
+          final details = YouTubeMusicResult.fromOEmbed(videoId, decoded);
+          if (details != null) return details;
+        }
+      }
+    } catch (error) {
+      debugPrint(
+        'YouTubeMusicApiService: oEmbed lookup failed for $videoId: $error',
+      );
+    }
+
+    if (_api == null || !_isInitialized) await initialize();
+
+    if (_api != null && _isInitialized) {
+      try {
+        // The music search bridge has no direct video-details endpoint, so
+        // search by ID and accept only real titles.
+        final response = await _api!
+            .searchMusic(
+              query: videoId,
+              limit: 10,
+              includeAudioUrl: false,
+              includeAlbumArt: true,
+            )
+            .timeout(const Duration(seconds: 10));
+
+        if (response.success && response.data != null) {
+          for (final item in response.data!) {
+            if (item.videoId != videoId ||
+                !YouTubeMusicResult.isUsableTitle(item.title)) {
+              continue;
+            }
+            return YouTubeMusicResult(
+              videoId: videoId,
+              title: item.title.trim(),
+              channelTitle: item.artists.trim().isEmpty
+                  ? 'YouTube'
+                  : item.artists.trim(),
+              thumbnailUrl: item.albumArt ?? '',
+              youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
+              durationSeconds: _parseDuration(item.duration),
+            );
+          }
+        }
+      } catch (e) {
+        debugPrint('YouTubeMusicApiService: getVideoDetails search failed: $e');
+      }
+    }
+
+    // Search results can omit titles for already-played or queued videos.
+    // Read canonical watch-page metadata by video ID before giving up.
+    yt_exp.YoutubeExplode? yt;
+    try {
+      yt = yt_exp.YoutubeExplode();
+      final video = await yt.videos
+          .get(yt_exp.VideoId(videoId))
+          .timeout(const Duration(seconds: 12));
+      if (!YouTubeMusicResult.isUsableTitle(video.title)) return null;
+      return YouTubeMusicResult(
+        videoId: videoId,
+        title: video.title,
+        channelTitle: video.author,
+        thumbnailUrl: video.thumbnails.mediumResUrl,
         youtubeUrl: 'https://www.youtube.com/watch?v=$videoId',
-        durationSeconds: 0,
+        durationSeconds: video.duration?.inSeconds,
       );
     } catch (e) {
-      debugPrint('YouTubeMusicApiService: getVideoDetails failed: $e');
+      debugPrint('YouTubeMusicApiService: metadata fallback failed: $e');
       return null;
+    } finally {
+      yt?.close();
     }
   }
 
@@ -486,7 +603,7 @@ class YouTubeMusicApiService {
           for (final item in response.data!) {
             if (item.videoId.isEmpty ||
                 item.videoId == videoId ||
-                item.title == 'Unknown') {
+                !YouTubeMusicResult.isUsableTitle(item.title)) {
               continue;
             }
             results.add(
@@ -528,7 +645,10 @@ class YouTubeMusicApiService {
         if (related != null && related.isNotEmpty) {
           final results = <YouTubeMusicResult>[];
           for (final v in related) {
-            if (v.id.value == videoId) continue;
+            if (v.id.value == videoId ||
+                !YouTubeMusicResult.isUsableTitle(v.title)) {
+              continue;
+            }
             final secs = v.duration?.inSeconds ?? 0;
             results.add(
               YouTubeMusicResult(
@@ -563,7 +683,10 @@ class YouTubeMusicApiService {
             .timeout(const Duration(seconds: 12));
         final results = <YouTubeMusicResult>[];
         for (final v in found) {
-          if (v.id.value == videoId) continue;
+          if (v.id.value == videoId ||
+              !YouTubeMusicResult.isUsableTitle(v.title)) {
+            continue;
+          }
           final secs = v.duration?.inSeconds ?? 0;
           if (secs > 0 && secs < 45) continue;
           results.add(

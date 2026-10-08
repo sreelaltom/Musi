@@ -1,69 +1,76 @@
-# Miscellaneous
-.env
-.env.*
-.env.youtube
-.env.youtube.*
-.env.development
-.env.production
-!.env.example
-*.class
-*.log
-*.pyc
-*.swp
-*.m4a
-.DS_Store
-.atom/
-.build/
-.buildlog/
-.history
-.svn/
-.swiftpm/
-migrate_working_dir/
+# Dart and Flutter generated files
+.dart_tool/
+/.dart-tool/
+.dartServer/
+.dart-local-appdata/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter_tool_state
+.packages
+.pub-cache/
+.pub/
+**/doc/api/
+**/flutter_build/
+**/build/
+/build/
+/coverage/
+*.symbols
+*.map.json
 
-# IntelliJ related
+# Android / Gradle generated files and local machine configuration
+**/.gradle/
+**/local.properties
+**/captures/
+**/GeneratedPluginRegistrant.java
+*.jks
+*.keystore
+key.properties
+
+# iOS / macOS generated files
+**/Pods/
+**/.symlinks/
+**/Flutter/ephemeral/
+**/Flutter/Generated.xcconfig
+**/Flutter/flutter_export_environment.sh
+**/DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# IDE and operating system files
+.idea/
+.vscode/
 *.iml
 *.ipr
 *.iws
-.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# The .vscode folder contains launch configuration and tasks you configure in
-# VS Code which you may wish to be included in version control, so this line
-# is commented out by default.
-#.vscode/
-
-# Flutter/Dart/Pub related
-**/doc/api/
-**/ios/Flutter/.last_build_id
-.dart_tool/
-.flutter-plugins-dependencies
-.pub-cache/
-.pub/
-/build/
-/coverage/
-**/build/
-!**/lib/build/
-
-# Symbolication related
-app.*.symbols
-
-# Obfuscation related
-app.*.map.json
-
-# Android Studio will place build artifacts here
-/android/app/debug
-/android/app/profile
-/android/app/release
-
-# Widget Preview related
-.widget_preview/
-
-# YouTube API keys / credentials
+# Local secrets, logs, and temporary files
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*~
 /youtube_api_key*.txt
 /api_key*.txt
 
-# Test audio files
-/test_*.m4a
-
-# Downloaded songs cache
+# App runtime data and downloaded media
 /downloads/
 /cache/
+*.m4a
+
+# Temporary root-level test captures (product assets in subfolders remain tracked)
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+/*.gif
+/*.bmp
+
+# Local tool output
+/Dart/
+/kotlin/
+/.musi-*.xml

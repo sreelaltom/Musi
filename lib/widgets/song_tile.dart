@@ -45,7 +45,7 @@ class SongTile extends StatelessWidget {
 
         final playability = providerManager.validatePlayability(song);
         final canPlay = playability == SourcePlayability.playable;
-        final canDownload = providerManager.canDownload(song);
+        final canDownload = downloadService.canDownloadSong(song);
 
         return InkWell(
           onTap: canPlay
